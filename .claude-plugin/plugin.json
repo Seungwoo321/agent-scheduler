@@ -1,0 +1,12 @@
+{
+  "name": "agent-scheduler",
+  "version": "0.1.0",
+  "description": "Schedule local commands and prompts to existing agent sessions with persistent files.",
+  "author": {
+    "name": "Seungwoo321",
+    "url": "https://github.com/Seungwoo321"
+  },
+  "homepage": "https://github.com/Seungwoo321/agent-scheduler",
+  "repository": "https://github.com/Seungwoo321/agent-scheduler",
+  "license": "MIT"
+}
