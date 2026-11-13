@@ -1,0 +1,16 @@
+{
+  "name": "agent-scheduler",
+  "owner": {
+    "name": "Seungwoo321"
+  },
+  "plugins": [
+    {
+      "name": "agent-scheduler",
+      "source": "./",
+      "description": "Schedule local commands and prompts to existing agent sessions with persistent files.",
+      "version": "0.1.0",
+      "license": "MIT"
+    }
+  ],
+  "description": "Persistent local scheduling for agent sessions and commands."
+}
