@@ -23,7 +23,7 @@ export async function history(store) {
 }
 
 export async function status(store) {
-  return { store: store.root, daemon: await store.read(join(store.root, 'daemon.lock', 'owner.json')), storeLock: await store.read(join(store.root, 'store.lock', 'owner.json')) };
+  return { store: store.root, daemon: await store.daemon(), daemonLock: await store.read(join(store.root, 'daemon.lock', 'owner.json')), storeLock: await store.read(join(store.root, 'store.lock', 'owner.json')) };
 }
 
 // Terminal targets are registered from the UI; command targets execute arbitrary programs and stay CLI-only.

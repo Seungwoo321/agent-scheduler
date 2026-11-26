@@ -2,6 +2,7 @@
 
 // src/cli.mjs
 import { readFile as readFile3, open as open2 } from "node:fs/promises";
+import { randomBytes as randomBytes2 } from "node:crypto";
 import { join as join3 } from "node:path";
 import { homedir } from "node:os";
 import { spawn as spawn2 } from "node:child_process";
@@ -1189,6 +1190,11 @@ var Store = class {
       await rm(path, { recursive: true });
     }
   }
+  // The live daemon owner on this host, or null; a stale lock does not count.
+  async daemon() {
+    const owner = await this.read(join(this.root, "daemon.lock", "owner.json"));
+    return owner && owner.host === hostname() && Number.isSafeInteger(owner.pid) && alive(owner.pid) && !await this.read(join(this.root, "daemon.lock", "stop.json")) ? owner : null;
+  }
   async unlock(name) {
     if (!["store", "daemon"].includes(name)) throw new Error("Unknown lock");
     return this.lock("recovery", async () => {
@@ -1346,7 +1352,7 @@ var page = true ? `<!doctype html>
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 var(--font); }
-  main { max-width: 1200px; margin: 0 auto; padding: var(--space-6) var(--space-4); }
+  main { width: 100%; padding: var(--space-6) var(--space-6); }
   h1 { font-size: 20px; margin: 0; } h2 { font-size: 16px; margin: 0 0 var(--space-3); }
   header { display: flex; gap: var(--space-4); align-items: center; flex-wrap: wrap; margin-bottom: var(--space-6); }
   header .prefs { margin-left: auto; display: flex; gap: var(--space-3); }
@@ -1370,7 +1376,10 @@ var page = true ? `<!doctype html>
   .grid { display: grid; gap: var(--space-4); grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
   .stack { display: grid; gap: var(--space-4); }
   pre { margin: 0; padding: var(--space-3); background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); max-height: 320px; overflow: auto; font: 12px/1.4 var(--mono); white-space: pre-wrap; }
-  .prompt { white-space: pre-wrap; max-width: 420px; }
+  .prompt { white-space: pre-wrap; min-width: 320px; }
+  [role="tablist"] { display: flex; gap: var(--space-1); border-bottom: 1px solid var(--border); margin-bottom: var(--space-4); }
+  [role="tab"] { min-height: 40px; padding: 0 var(--space-4); border: 0; border-bottom: 2px solid transparent; background: none; color: var(--muted); font: inherit; font-weight: 600; cursor: pointer; }
+  [role="tab"][aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
   [role="alert"] { color: var(--danger); min-height: 1.5em; margin: 0 0 var(--space-3); }
 </style>
 </head>
@@ -1385,6 +1394,11 @@ var page = true ? `<!doctype html>
   </header>
   <p role="alert" id="error"></p>
 
+  <div role="tablist" id="tabs">
+    <button role="tab" type="button" id="tab-schedules" aria-controls="panel-schedules" aria-selected="true" data-i18n="schedules"></button>
+    <button role="tab" type="button" id="tab-runs" aria-controls="panel-runs" aria-selected="false" tabindex="-1" data-i18n="runHistory"></button>
+  </div>
+  <div role="tabpanel" id="panel-schedules" aria-labelledby="tab-schedules">
   <section aria-labelledby="schedules-title">
     <div class="actions" style="justify-content: space-between"><h2 id="schedules-title" data-i18n="schedules"></h2>
       <div class="actions"><button class="button" type="button" id="refresh" data-i18n="refresh"></button><button class="button" data-variant="primary" type="button" id="new" data-i18n="newSchedule"></button></div></div>
@@ -1423,10 +1437,13 @@ var page = true ? `<!doctype html>
     </form>
   </section>
 
+  </div>
+  <div role="tabpanel" id="panel-runs" aria-labelledby="tab-runs" hidden>
   <section aria-labelledby="history-title">
     <h2 id="history-title" data-i18n="recentRuns"></h2>
     <table><thead><tr><th scope="col" data-i18n="started"></th><th scope="col" data-i18n="schedule"></th><th scope="col" data-i18n="status"></th><th scope="col" data-i18n="deliveredPrompt"></th><th scope="col" data-i18n="detail"></th></tr></thead><tbody id="history"></tbody></table>
   </section>
+  </div>
 </main>
 <script>
 const messages = {
@@ -1439,10 +1456,10 @@ const messages = {
     promptHelp: 'Write what the receiving session should do, in words a person can review: the goal, what to check, the completion criteria, and what to do when blocked. The exact text is stored and delivered as written; newlines become spaces.',
     interval: 'Interval', once: 'Once', intervalMinutes: 'Interval (minutes)', cronExpression: 'Cron expression', timezone: 'Timezone', runAt: 'Run at',
     maxRuns: 'Max runs', timeoutSeconds: 'Timeout (seconds)', cooldownMinutes: 'Cooldown (minutes)', enabled: 'Enabled', save: 'Save', cancel: 'Cancel',
-    recentRuns: 'Recent runs', started: 'Started', schedule: 'Schedule', status: 'Status', deliveredPrompt: 'Delivered prompt', detail: 'Detail',
+    recentRuns: 'Recent runs', runHistory: 'Run history', started: 'Started', schedule: 'Schedule', status: 'Status', deliveredPrompt: 'Delivered prompt', detail: 'Detail',
     editTitle: id => \`Edit \${id}\`, edit: 'Edit', pause: 'Pause', resume: 'Resume', delete: 'Delete', confirmDelete: id => \`Delete schedule \${id}? Run receipts are kept.\`,
     pending: 'pending', enabledBadge: 'enabled', paused: 'paused', noSchedules: 'No schedules.', commandTarget: 'Command target \u2014 edit with the CLI',
-    daemonRunning: pid => \`Daemon running (pid \${pid})\`, daemonStopped: 'Daemon not running \u2014 schedules fire only after \`start\`',
+    daemonRunning: pid => \`Daemon running (pid \${pid})\`, daemonStopped: 'Daemon is stopping',
     loading: 'Loading\u2026', selectTerminal: 'Select a terminal', noAgent: '[no running agent]', notListed: 'not currently listed', selectFirst: 'Select a terminal first',
     once_: when => \`once \${when}\`, every: min => \`every \${min} min\`, cron: (e, tz) => \`cron \${e} (\${tz})\`,
     noToken: 'Open the URL printed by \`agent-scheduler ui\`; it carries the access token.', screenLabel: 'Recent terminal screen',
@@ -1456,10 +1473,10 @@ const messages = {
     promptHelp: '\uC218\uC2E0 \uC138\uC158\uC774 \uD560 \uC77C\uC744 \uC0AC\uB78C\uC774 \uAC80\uD1A0\uD560 \uC218 \uC788\uB294 \uBB38\uC7A5\uC73C\uB85C \uC501\uB2C8\uB2E4: \uBAA9\uC801, \uD655\uC778\uD560 \uB300\uC0C1, \uC644\uB8CC \uAE30\uC900, \uB9C9\uD614\uC744 \uB54C \uD560 \uC77C. \uC785\uB825\uD55C \uBB38\uC7A5\uC774 \uADF8\uB300\uB85C \uC800\uC7A5\uB418\uACE0 \uC804\uB2EC\uB418\uBA70, \uC904\uBC14\uAFC8\uC740 \uACF5\uBC31\uC774 \uB429\uB2C8\uB2E4.',
     interval: '\uBC18\uBCF5 \uAC04\uACA9', once: '\uD55C \uBC88', intervalMinutes: '\uAC04\uACA9(\uBD84)', cronExpression: 'Cron \uC2DD', timezone: '\uC2DC\uAC04\uB300', runAt: '\uC2E4\uD589 \uC2DC\uAC01',
     maxRuns: '\uCD5C\uB300 \uC2E4\uD589 \uD69F\uC218', timeoutSeconds: '\uC81C\uD55C \uC2DC\uAC04(\uCD08)', cooldownMinutes: '\uCD5C\uC18C \uAC04\uACA9(\uBD84)', enabled: '\uC0AC\uC6A9', save: '\uC800\uC7A5', cancel: '\uCDE8\uC18C',
-    recentRuns: '\uCD5C\uADFC \uC2E4\uD589 \uAE30\uB85D', started: '\uC2DC\uC791', schedule: '\uC2A4\uCF00\uC904', status: '\uACB0\uACFC', deliveredPrompt: '\uC804\uB2EC\uB41C \uD504\uB86C\uD504\uD2B8', detail: '\uC0C1\uC138',
+    recentRuns: '\uCD5C\uADFC \uC2E4\uD589 \uAE30\uB85D', runHistory: '\uC2E4\uD589 \uAE30\uB85D', started: '\uC2DC\uC791', schedule: '\uC2A4\uCF00\uC904', status: '\uACB0\uACFC', deliveredPrompt: '\uC804\uB2EC\uB41C \uD504\uB86C\uD504\uD2B8', detail: '\uC0C1\uC138',
     editTitle: id => \`\${id} \uC218\uC815\`, edit: '\uC218\uC815', pause: '\uC77C\uC2DC\uC815\uC9C0', resume: '\uC7AC\uAC1C', delete: '\uC0AD\uC81C', confirmDelete: id => \`\${id} \uC2A4\uCF00\uC904\uC744 \uC0AD\uC81C\uD560\uAE4C\uC694? \uC2E4\uD589 \uAE30\uB85D\uC740 \uB0A8\uC2B5\uB2C8\uB2E4.\`,
     pending: '\uD655\uC778 \uD544\uC694', enabledBadge: '\uC0AC\uC6A9 \uC911', paused: '\uC77C\uC2DC\uC815\uC9C0', noSchedules: '\uC2A4\uCF00\uC904\uC774 \uC5C6\uC2B5\uB2C8\uB2E4.', commandTarget: '\uBA85\uB839 \uB300\uC0C1 \u2014 CLI \uB85C \uC218\uC815',
-    daemonRunning: pid => \`\uB370\uBAAC \uC2E4\uD589 \uC911 (pid \${pid})\`, daemonStopped: '\uB370\uBAAC\uC774 \uAEBC\uC838 \uC788\uC2B5\uB2C8\uB2E4 \u2014 \`start\` \uD6C4\uC5D0 \uC2E4\uD589\uB429\uB2C8\uB2E4',
+    daemonRunning: pid => \`\uB370\uBAAC \uC2E4\uD589 \uC911 (pid \${pid})\`, daemonStopped: '\uB370\uBAAC\uC774 \uC885\uB8CC \uC911\uC785\uB2C8\uB2E4',
     loading: '\uBD88\uB7EC\uC624\uB294 \uC911\u2026', selectTerminal: '\uD130\uBBF8\uB110\uC744 \uC120\uD0DD\uD558\uC138\uC694', noAgent: '[\uC2E4\uD589 \uC911\uC778 \uC5D0\uC774\uC804\uD2B8 \uC5C6\uC74C]', notListed: '\uD604\uC7AC \uBAA9\uB85D\uC5D0 \uC5C6\uC74C', selectFirst: '\uBA3C\uC800 \uD130\uBBF8\uB110\uC744 \uC120\uD0DD\uD558\uC138\uC694',
     once_: when => \`\uD55C \uBC88 \${when}\`, every: min => \`\${min}\uBD84\uB9C8\uB2E4\`, cron: (e, tz) => \`cron \${e} (\${tz})\`,
     noToken: '\`agent-scheduler ui\` \uAC00 \uCD9C\uB825\uD55C \uC8FC\uC18C\uB85C \uC5EC\uC138\uC694. \uADF8 \uC8FC\uC18C\uC5D0 \uC811\uADFC \uD1A0\uD070\uC774 \uB4E4\uC5B4 \uC788\uC2B5\uB2C8\uB2E4.', screenLabel: '\uCD5C\uADFC \uD130\uBBF8\uB110 \uD654\uBA74',
@@ -1468,7 +1485,7 @@ const messages = {
 const token = new URLSearchParams(location.hash.slice(1)).get('token');
 const $ = id => document.getElementById(id);
 const form = $('form');
-let schedules = [], editing = null, lastError = null, receivers = new Map();
+let schedules = [], editing = null, lastError = null, receivers = new Map(), labelsRequested = false;
 let lang = localStorage.getItem('lang') ?? (navigator.language?.startsWith('ko') ? 'ko' : 'en');
 const t = (key, ...args) => { const value = messages[lang][key]; return typeof value === 'function' ? value(...args) : value; };
 
@@ -1510,7 +1527,9 @@ const button = (label, variant, onClick, disabled) => { const b = document.creat
 async function refresh() {
   clearError();
   try {
-    const [list, runs, status] = await Promise.all([api('GET', '/api/schedules'), api('GET', '/api/history'), api('GET', '/api/status'), receivers.size ? null : remember(api('GET', '/api/terminals')).catch(() => null)]);
+    // Receiver names arrive later; schedules render first and are relabelled once they load.
+    if (!labelsRequested) { labelsRequested = true; remember(api('GET', '/api/terminals')).then(refresh, () => {}); }
+    const [list, runs, status] = await Promise.all([api('GET', '/api/schedules'), api('GET', '/api/history'), api('GET', '/api/status')]);
     schedules = list;
     $('status').textContent = \`\${status.daemon ? t('daemonRunning', status.daemon.pid) : t('daemonStopped')} \xB7 \${status.store}\`;
     const body = $('schedules'); body.replaceChildren();
@@ -1607,6 +1626,24 @@ form.addEventListener('submit', async event => {
     $('editor').hidden = true; editing = null; await refresh();
   } catch (error) { fail(error); }
 });
+const tabs = [$('tab-schedules'), $('tab-runs')];
+function selectTab(tab, focus) {
+  for (const t of tabs) {
+    const selected = t === tab;
+    t.setAttribute('aria-selected', String(selected)); t.tabIndex = selected ? 0 : -1;
+    $(t.getAttribute('aria-controls')).hidden = !selected;
+  }
+  localStorage.setItem('tab', tab.id);
+  if (focus) tab.focus();
+}
+for (const t of tabs) {
+  t.addEventListener('click', () => selectTab(t));
+  t.addEventListener('keydown', e => {
+    const i = tabs.indexOf(t), next = e.key === 'ArrowRight' ? tabs[(i + 1) % tabs.length] : e.key === 'ArrowLeft' ? tabs[(i + tabs.length - 1) % tabs.length] : e.key === 'Home' ? tabs[0] : e.key === 'End' ? tabs.at(-1) : null;
+    if (next) { e.preventDefault(); selectTab(next, true); }
+  });
+}
+selectTab($(localStorage.getItem('tab') ?? 'tab-schedules') ?? tabs[0]);
 applyTheme(); applyLanguage();
 if (!token) fail({ key: 'noToken' });
 else refresh();
@@ -1639,7 +1676,7 @@ async function history(store2) {
   return Promise.all(files.map((n) => store2.read(join2(store2.root, "runs", n))));
 }
 async function status(store2) {
-  return { store: store2.root, daemon: await store2.read(join2(store2.root, "daemon.lock", "owner.json")), storeLock: await store2.read(join2(store2.root, "store.lock", "owner.json")) };
+  return { store: store2.root, daemon: await store2.daemon(), daemonLock: await store2.read(join2(store2.root, "daemon.lock", "owner.json")), storeLock: await store2.read(join2(store2.root, "store.lock", "owner.json")) };
 }
 var terminalSpec = (spec) => {
   if (spec?.target?.type === "command") throw Object.assign(new Error("Command targets are registered and edited with the CLI"), { status: 403 });
@@ -1698,23 +1735,58 @@ function createUi(store2, { token = randomBytes(24).toString("base64url"), termi
 
 // src/cli.mjs
 var args = process.argv.slice(2);
-var option = (name) => {
-  const index = args.indexOf(name);
-  if (index === -1) return void 0;
-  if (!args[index + 1]) throw new Error(`${name} requires a value`);
-  return args.splice(index, 2)[1];
-};
-var root = option("--store") ?? process.env.AGENT_SCHEDULER_HOME ?? join3(homedir(), ".local", "state", "agent-scheduler");
-var port = option("--port");
+var root = process.env.AGENT_SCHEDULER_HOME ?? join3(homedir(), ".local", "state", "agent-scheduler");
 var store = new Store(root);
 var [command, ...rest] = args;
 var print = (value) => process.stdout.write(JSON.stringify(value, null, 2) + "\n");
+var port = Number(process.env.AGENT_SCHEDULER_PORT ?? 47800);
+async function uiToken() {
+  const path = join3(store.root, "ui-token");
+  const existing = (await readFile3(path, "utf8").catch(() => "")).trim();
+  if (existing) return existing;
+  const token = randomBytes2(24).toString("base64url");
+  const file = await open2(path, "wx", 384).catch(() => null);
+  if (!file) return (await readFile3(path, "utf8")).trim();
+  try {
+    await file.writeFile(token);
+  } finally {
+    await file.close();
+  }
+  return token;
+}
+var uiUrl = async () => `http://127.0.0.1:${port}/#token=${await uiToken()}`;
+async function startDaemon() {
+  if (await store.read(join3(store.root, "daemon.lock", "owner.json"))) {
+    if (await store.daemon()) throw new Error("Daemon is already running");
+    await store.unlock("daemon");
+  }
+  const log = await open2(join3(store.root, "daemon.log"), "a", 384);
+  try {
+    const child = spawn2(process.execPath, [fileURLToPath(import.meta.url), "serve"], { detached: true, stdio: ["ignore", log.fd, log.fd], env: { ...process.env, AGENT_SCHEDULER_HOME: store.root } });
+    child.unref();
+    for (let i3 = 0; i3 < 30; i3++) {
+      await new Promise((r) => setTimeout(r, 100));
+      const owner = await store.read(join3(store.root, "daemon.lock", "owner.json"));
+      if (owner?.pid === child.pid) return { status: "started", ...owner };
+    }
+    throw new Error("Daemon did not acquire its lock; inspect daemon.log");
+  } finally {
+    await log.close();
+  }
+}
+async function ensureDaemon() {
+  const owner = await store.daemon();
+  return owner ? { status: "running", ...owner } : startDaemon();
+}
 try {
   await store.init();
   if (!command || command === "help" || command === "--help") {
-    console.log(`agent-scheduler 0.2.0 \u2014 Node >=22
+    console.log(`agent-scheduler 0.3.0 \u2014 Node >=22
 
-Usage: agent-scheduler [--store PATH] COMMAND
+Usage: agent-scheduler COMMAND
+
+One global store and daemon serve all coding agents on this computer.
+Registering or resuming starts the daemon when it is absent.
 
 put FILE|-       Validate and register a JSON schedule
 list             List definitions and runtime state
@@ -1724,14 +1796,14 @@ remove ID        Remove definition, retain receipts
 resolve ID RUN   Acknowledge uncertain run after owner exit; never replay
 tick             Dispatch due schedules once
 serve            Run scheduler in foreground
-start            Start a detached scheduler
+start            Start the global daemon (scheduler and management page) if absent
 stop             Request graceful daemon stop
 status           Inspect daemon owner and store
 history          Read run receipts
 unlock NAME      Remove store/daemon lock only after confirmed owner exit
 terminals        List cmux, orca and tmux receivers
 session-end      Remove schedules addressed to this terminal (session end hook)
-ui [--port N]    Serve the local management page on 127.0.0.1
+ui               Start the daemon if needed and print the management page URL
 
 No API key or model process is required.`);
   } else if (command === "put") {
@@ -1741,15 +1813,19 @@ No API key or model process is required.`);
       input = "";
       for await (const chunk of process.stdin) input += chunk;
     } else input = await readFile3(rest[0], "utf8");
-    print(await store.put(JSON.parse(input)));
+    const spec = validate(JSON.parse(input));
+    const daemon = await ensureDaemon();
+    print({ ...await store.put(spec), daemon, ui: await uiUrl() });
   } else if (command === "list") print(await store.list());
-  else if (command === "pause" || command === "resume") print(await store.enable(rest[0], command === "resume"));
-  else if (command === "remove") print(await store.remove(rest[0]));
+  else if (command === "pause" || command === "resume") {
+    const daemon = command === "resume" ? await ensureDaemon() : void 0;
+    print({ ...await store.enable(rest[0], command === "resume"), ...daemon ? { daemon } : {} });
+  } else if (command === "remove") print(await store.remove(rest[0]));
   else if (command === "resolve") print(await store.resolveRun(rest[0], rest[1]));
   else if (command === "unlock") print(await store.unlock(rest[0]));
   else if (command === "tick") print(await store.tick());
   else if (command === "history") print(await history(store));
-  else if (command === "status") print(await status(store));
+  else if (command === "status") print({ ...await status(store), ui: await uiUrl() });
   else if (command === "terminals") print(await listTerminals());
   else if (command === "session-end") {
     let input = "";
@@ -1766,20 +1842,20 @@ No API key or model process is required.`);
       const agent = receivers.length ? await agentForSession(hook.session_id) : null;
       print({ receivers, agent, schedules: receivers.length ? await store.removeForReceivers(receivers, agent) : [] });
     }
-  } else if (command === "ui") {
-    const { server, token } = createUi(store);
-    await new Promise((resolve2, reject) => {
-      server.once("error", reject);
-      server.listen(Number(port ?? 0), "127.0.0.1", resolve2);
-    });
-    print({ url: `http://127.0.0.1:${server.address().port}/#token=${token}`, store: store.root });
-    await new Promise((resolve2) => {
-      process.once("SIGINT", resolve2);
-      process.once("SIGTERM", resolve2);
-    });
-    await new Promise((resolve2) => server.close(resolve2));
-  } else if (command === "serve") {
+  } else if (command === "ui") print({ url: await uiUrl(), daemon: await ensureDaemon(), store: store.root });
+  else if (command === "serve") {
     await store.lock("daemon", async () => {
+      const { server } = createUi(store, { token: await uiToken() });
+      await new Promise((resolve2) => {
+        server.once("error", (error) => {
+          process.stderr.write(JSON.stringify({ error: `management page unavailable: ${error.message}`, at: (/* @__PURE__ */ new Date()).toISOString() }) + "\n");
+          resolve2();
+        });
+        server.listen(port, "127.0.0.1", () => {
+          print({ ui: `http://127.0.0.1:${port}/`, at: (/* @__PURE__ */ new Date()).toISOString() });
+          resolve2();
+        });
+      });
       const controller = new AbortController();
       const active = /* @__PURE__ */ new Set();
       let stopping = false;
@@ -1805,25 +1881,14 @@ No API key or model process is required.`);
         }
       } finally {
         controller.abort();
+        server.close();
         await Promise.all(active);
         process.removeListener("SIGINT", stop);
         process.removeListener("SIGTERM", stop);
       }
     });
-  } else if (command === "start") {
-    if (await store.read(join3(store.root, "daemon.lock", "owner.json"))) throw new Error("Daemon lock exists; inspect status before starting");
-    const log = await open2(join3(store.root, "daemon.log"), "a", 384);
-    try {
-      const child = spawn2(process.execPath, [fileURLToPath(import.meta.url), "--store", store.root, "serve"], { detached: true, stdio: ["ignore", log.fd, log.fd] });
-      child.unref();
-      await new Promise((r) => setTimeout(r, 500));
-      const owner = await store.read(join3(store.root, "daemon.lock", "owner.json"));
-      if (owner?.pid !== child.pid) throw new Error("Daemon did not acquire its lock; inspect daemon.log");
-      print({ status: "started", ...owner, store: store.root });
-    } finally {
-      await log.close();
-    }
-  } else if (command === "stop") {
+  } else if (command === "start") print({ ...await ensureDaemon(), store: store.root, ui: await uiUrl() });
+  else if (command === "stop") {
     const path = join3(store.root, "daemon.lock");
     const owner = await store.read(join3(path, "owner.json"));
     if (!owner) throw new Error("No daemon owner");

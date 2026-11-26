@@ -237,7 +237,7 @@ test('AC-3 session end removes schedules addressed to that terminal only', async
 test('AC-3 session-end hook keeps schedules on /clear and /resume', async t => {
   const store = await fixture(t), uuid = '12345678-1234-1234-1234-123456789abc';
   await store.put({ ...spec('mine'), target: { type: 'cmux', workspace: uuid, surface: uuid, prompt: 'check' } });
-  const run = reason => spawnSync(process.execPath, [new URL('../src/cli.mjs', import.meta.url).pathname, '--store', store.root, 'session-end'], { input: JSON.stringify({ session_id: 's', reason }), encoding: 'utf8', env: { ...process.env, CMUX_WORKSPACE_ID: uuid, CMUX_SURFACE_ID: uuid, TMUX: '', TMUX_PANE: '', ORCA_PANE_KEY: '' } });
+  const run = reason => spawnSync(process.execPath, [new URL('../src/cli.mjs', import.meta.url).pathname, 'session-end'], { input: JSON.stringify({ session_id: 's', reason }), encoding: 'utf8', env: { ...process.env, AGENT_SCHEDULER_HOME: store.root, CMUX_WORKSPACE_ID: uuid, CMUX_SURFACE_ID: uuid, TMUX: '', TMUX_PANE: '', ORCA_PANE_KEY: '' } });
   for (const reason of ['clear', 'resume']) assert.equal(JSON.parse(run(reason).stdout).skipped, reason);
   assert.equal((await store.list()).length, 1);
   assert.deepEqual(JSON.parse(run('prompt_input_exit').stdout).schedules, [{ id: 'mine', removed: true }]);
@@ -247,4 +247,30 @@ test('AC-2 partial terminal submission failure does not try another transport', 
   let calls = 0;
   await assert.rejects(dispatch({ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'hello' }, { execute: async () => ({ code: ++calls === 3 ? 1 : 0, output: '%3' }) }), /Transport failed/);
   assert.equal(calls, 3);
+});
+
+test('AC-6 registering starts the one detached daemon, which also serves the management page', async t => {
+  const store = await fixture(t), cli = new URL('../src/cli.mjs', import.meta.url).pathname;
+  const env = { ...process.env, AGENT_SCHEDULER_HOME: store.root, AGENT_SCHEDULER_PORT: String(40000 + Math.floor(Math.random() * 20000)) };
+  const run = (args, input) => spawnSync(process.execPath, [cli, ...args], { input, encoding: 'utf8', env });
+  // Wait for the daemon process itself to exit before the fixture removes its store.
+  const exited = async pid => { for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { return true; } await new Promise(r => setTimeout(r, 100)); } return false; };
+  let daemonPid;
+  t.after(async () => { run(['stop']); if (daemonPid && !await exited(daemonPid)) process.kill(daemonPid, 'SIGKILL'); });
+  assert.equal(run(['put', '-'], JSON.stringify({ ...spec(), id: 'bad', maxRuns: 0 })).status, 1);
+  assert.equal(await store.daemon(), null, 'an invalid definition does not start the daemon');
+  const first = JSON.parse(run(['put', '-'], JSON.stringify({ ...spec(), enabled: false })).stdout);
+  assert.equal(first.daemon.status, 'started');
+  daemonPid = first.daemon.pid;
+  const second = JSON.parse(run(['put', '-'], JSON.stringify({ ...spec('other'), enabled: false })).stdout);
+  assert.equal(second.daemon.status, 'running'); assert.equal(second.daemon.pid, first.daemon.pid);
+  assert.equal(second.ui, first.ui);
+  let page;
+  for (let i = 0; i < 30 && !page?.ok; i++) { await new Promise(r => setTimeout(r, 100)); page = await fetch(first.ui.split('#')[0]).catch(() => null); }
+  assert.equal(page?.status, 200);
+  const status = await fetch(first.ui.split('#')[0] + 'api/status', { headers: { authorization: `Bearer ${new URL(first.ui).hash.slice(7)}` } }).then(r => r.json());
+  assert.equal(status.daemon.pid, first.daemon.pid);
+  run(['stop']);
+  assert.equal(await exited(daemonPid), true);
+  assert.equal(await store.daemon(), null);
 });

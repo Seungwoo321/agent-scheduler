@@ -81,6 +81,11 @@ export class Store {
       return await fn();
     } finally { await rm(path, { recursive: true }); }
   }
+  // The live daemon owner on this host, or null; a stale lock does not count.
+  async daemon() {
+    const owner = await this.read(join(this.root, 'daemon.lock', 'owner.json'));
+    return owner && owner.host === hostname() && Number.isSafeInteger(owner.pid) && alive(owner.pid) && !(await this.read(join(this.root, 'daemon.lock', 'stop.json'))) ? owner : null;
+  }
   async unlock(name) {
     if (!['store', 'daemon'].includes(name)) throw new Error('Unknown lock');
     // Recovery callers must not remove a replacement owner's lock.
