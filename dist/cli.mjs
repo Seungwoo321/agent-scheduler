@@ -834,6 +834,26 @@ var json = (output) => {
     return null;
   }
 };
+var sleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
+var emptyInput = (left) => /^\s*[❯›>]\s*$/.test(left);
+var wide = (cp) => cp >= 4352 && cp <= 4447 || cp >= 11904 && cp <= 42191 || cp >= 44032 && cp <= 55203 || cp >= 63744 && cp <= 64255 || cp >= 65072 && cp <= 65103 || cp >= 65280 && cp <= 65376 || cp >= 65504 && cp <= 65510 || cp >= 127744 && cp <= 129791 || cp >= 131072;
+var cellPrefix = (line, cells) => {
+  let out = "", used = 0;
+  for (const ch of line) {
+    const w2 = wide(ch.codePointAt(0)) ? 2 : 1;
+    if (used + w2 > cells) break;
+    out += ch;
+    used += w2;
+  }
+  return out;
+};
+async function confirmCleared(readLeft) {
+  for (let i3 = 0; i3 < 20; i3++) {
+    await sleep(250);
+    if (emptyInput(await readLeft().catch(() => ""))) return true;
+  }
+  return false;
+}
 var terminals = {
   cmux: {
     fields: ["workspace", "surface"],
@@ -854,10 +874,23 @@ var terminals = {
         if (!live.some((r) => r.pid === t.agent.pid) || starts.get(t.agent.pid) !== t.agent.startedAt) throw gone("The registered agent process no longer runs on the cmux surface");
       }
     },
+    async inputLeft(call, t) {
+      const grid = json((await call(["cmux", "rpc", "terminal.replay", JSON.stringify({ workspace_id: t.workspace, surface_id: t.surface })])).output)?.render_grid;
+      if (!grid?.cursor) throw new Error("cmux render grid unavailable");
+      return (grid.row_spans ?? []).filter((span) => span.row === grid.cursor.row && span.column < grid.cursor.column).sort((a, b2) => a.column - b2.column).map((span) => span.text).join("");
+    },
+    async ready(call, t) {
+      const sessions = json((await call(["cmux", "sessions", "list", "--surface", t.surface, "--json", "--all"])).output)?.sessions ?? [];
+      const live = liveRecords(sessions, t.surface).filter((r) => !t.agent || r.pid === t.agent.pid).sort((a, b2) => (b2.updated_at_unix ?? 0) - (a.updated_at_unix ?? 0));
+      if (live[0]?.agent_lifecycle && live[0].agent_lifecycle !== "idle") return { ok: false, reason: `agent is ${live[0].agent_lifecycle}` };
+      const left = await this.inputLeft(call, t);
+      return emptyInput(left) ? { ok: true } : { ok: false, reason: "input line holds unsubmitted text" };
+    },
     async submit(call, t, prompt) {
       await call(["cmux", "rpc", "surface.send_text", JSON.stringify({ workspace_id: t.workspace, surface_id: t.surface, text: prompt })]);
-      await new Promise((resolve2) => setTimeout(resolve2, 250));
+      await sleep(250);
       await call(["cmux", "send-key", "--workspace", t.workspace, "--surface", t.surface, "Enter"]);
+      return { confirmed: await confirmCleared(() => this.inputLeft(call, t)), proof: "input-line-cleared" };
     },
     fromEnv: async (env) => env.CMUX_WORKSPACE_ID && env.CMUX_SURFACE_ID ? { workspace: env.CMUX_WORKSPACE_ID, surface: env.CMUX_SURFACE_ID } : null,
     async read(call, t) {
@@ -892,9 +925,15 @@ var terminals = {
       const terminal = shown?.result?.terminal ?? shown?.result ?? shown;
       if (!terminal?.agentIdentity) throw gone("No running agent in the orca terminal");
     },
+    async ready(call, t) {
+      const waited = await call(["orca", "terminal", "wait", "--terminal", t.terminal, "--for", "tui-idle", "--timeout-ms", "2000", "--json"]).catch((error) => error);
+      return waited instanceof Error ? { ok: false, reason: `agent is not idle (${waited.message})` } : { ok: true };
+    },
     async submit(call, t, prompt) {
-      const sent = json((await call(["orca", "terminal", "send", "--terminal", t.terminal, "--text", prompt, "--enter", "--json"])).output);
+      const sent = json((await call(["orca", "terminal", "send", "--terminal", t.terminal, "--text", prompt, "--enter", "--wait-submit", "10", "--json"])).output);
       if (sent?.ok === false) throw new Error(`orca send failed (${sent.error?.code ?? "unknown"})`);
+      const receipt = JSON.stringify(sent ?? {});
+      return { confirmed: /input_accepted|turn_started/.test(receipt), proof: /turn_started/.test(receipt) ? "orca-turn-started" : "orca-input-accepted" };
     },
     async fromEnv(env, call) {
       if (!env.ORCA_PANE_KEY) return null;
@@ -929,10 +968,20 @@ var terminals = {
       if (pane !== t.pane) throw gone("tmux pane identity mismatch");
       if (shell.test(command2 ?? "")) throw gone("No running agent in the tmux pane");
     },
+    async inputLeft(call, t) {
+      const [x2, y2] = (await call(["tmux", "-S", t.socket, "display-message", "-p", "-t", t.pane, "#{cursor_x}	#{cursor_y}"])).output.trim().split("	").map(Number);
+      if (!Number.isInteger(x2) || !Number.isInteger(y2)) throw new Error("tmux cursor unavailable");
+      const line = (await call(["tmux", "-S", t.socket, "capture-pane", "-p", "-t", t.pane, "-S", String(y2), "-E", String(y2)])).output.replace(/\n$/, "");
+      return cellPrefix(line, x2);
+    },
+    async ready(call, t) {
+      return emptyInput(await this.inputLeft(call, t)) ? { ok: true } : { ok: false, reason: "input line holds unsubmitted text" };
+    },
     async submit(call, t, prompt) {
       await call(["tmux", "-S", t.socket, "send-keys", "-t", t.pane, "-l", "--", prompt]);
-      await new Promise((resolve2) => setTimeout(resolve2, 250));
+      await sleep(250);
       await call(["tmux", "-S", t.socket, "send-keys", "-t", t.pane, "Enter"]);
+      return { confirmed: await confirmCleared(() => this.inputLeft(call, t)), proof: "input-line-cleared" };
     },
     fromEnv: async (env) => env.TMUX && env.TMUX_PANE ? { socket: env.TMUX.split(",")[0], pane: env.TMUX_PANE } : null,
     async read(call, t) {
@@ -1051,9 +1100,12 @@ async function dispatch(target, options = {}) {
   } catch (error) {
     return { status: "not-delivered", acknowledgment: "receiver-check-failed-before-input", receiverGone: !!error.receiverGone, error: error.message };
   }
+  const ready = await manager.ready(call, target).catch((error) => ({ ok: false, reason: error.message }));
+  if (!ready.ok) return { status: "not-delivered", acknowledgment: "receiver-not-ready-before-input", receiverGone: false, error: ready.reason };
   const prompt = target.prompt.replace(/[\r\n]+/g, " ");
-  await manager.submit(call, target, target.mode === "goal" ? `/goal ${prompt}` : prompt);
-  return { status: "transport-accepted", acknowledgment: "delivery-only-not-model-turn" };
+  const sent = await manager.submit(call, target, target.mode === "goal" ? `/goal ${prompt}` : prompt);
+  if (!sent.confirmed) return { status: "uncertain", acknowledgment: "submission-not-confirmed", error: "Input was typed but submission was not observed; inspect the receiver before resolving" };
+  return { status: "transport-accepted", acknowledgment: "submitted-not-model-turn", proof: sent.proof };
 }
 async function listTerminals(options = {}) {
   const call = caller({ timeoutMs: 1e4, maxOutput: 16 << 20, ...options });
@@ -1810,7 +1862,7 @@ async function ensureDaemon() {
 try {
   await store.init();
   if (!command || command === "help" || command === "--help") {
-    console.log(`agent-scheduler 0.3.0 \u2014 Node >=22
+    console.log(`agent-scheduler 0.3.1 \u2014 Node >=22
 
 Usage: agent-scheduler COMMAND
 

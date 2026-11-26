@@ -1,6 +1,6 @@
 # Release verification
 
-Unit tests require no provider credentials and do not modify existing user sessions. They cover validation/replacement, timezone calculation, one-shot execution, direct-file interval initialization, budgets, expiry, per-target concurrency, simultaneous finalization, locks, ambiguity, literal arguments/terminal input, receiver verification and auto-pause, session-end removal, goal delivery, the management API's token/host checks and CLI-only command targets, and timeout cleanup of child processes.
+Unit tests require no provider credentials and do not modify existing user sessions. They cover validation/replacement, timezone calculation, one-shot execution, direct-file interval initialization, budgets, expiry, per-target concurrency, simultaneous finalization, locks, ambiguity, literal arguments/terminal input, receiver verification and auto-pause, input-line readiness (draft or busy agent skips without input) and submission confirmation (unconfirmed Enter stays uncertain), session-end removal, goal delivery, the management API's token/host checks and CLI-only command targets, and timeout cleanup of child processes.
 
 Release checks:
 
