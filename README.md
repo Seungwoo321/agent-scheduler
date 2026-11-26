@@ -120,7 +120,7 @@ The plugin skill runs these commands with `node <installed-plugin>/dist/cli.mjs`
 | `orca` | `orca terminal send --enter` to a runtime terminal handle | Transport accepted |
 | `tmux` | Literal text to an exact pane, then Enter | Transport accepted |
 
-Every terminal target is verified before input: the terminal must exist and a coding agent must still run in it. Otherwise nothing is typed; an absent receiver pauses the schedule, while a failed check (shutdown, timeout) leaves it enabled. `mode: "goal"` delivers the prompt as `/goal <prompt>` for Claude Code and Codex alike. When a receiving session ends (not on `/clear` or `/resume`), the plugin's `SessionEnd` hook removes the schedules addressed to its terminal; a schedule bound to an agent `session` is removed only by that session.
+Every terminal target is verified before input: the terminal must exist and a coding agent must still run in it. Otherwise nothing is typed; an absent receiver pauses the schedule, while a failed check (shutdown, timeout) leaves it enabled. `mode: "goal"` delivers the prompt as `/goal <prompt>` for Claude Code and Codex alike. When a receiving session ends (not on `/clear` or `/resume`), the plugin's `SessionEnd` hook removes the schedules addressed to its terminal; a cmux schedule bound to its `agent` process is removed only when that process ends.
 
 Prompts are written at registration from the actual task context and stored verbatim, so every delivered instruction is readable in the definition and receipts. Transport acceptance does **not** prove a model turn started or finished. The engine does not judge tasks, merge PRs, or mark work complete.
 

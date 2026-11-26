@@ -184,14 +184,31 @@ test('AC-2 a failed receiver check that is not absence keeps the schedule enable
   assert.equal(saved.enabled, true); assert.equal(state.pending, undefined);
 });
 
-test('AC-2 a cmux schedule bound to an agent session pauses when another session replaced it', async t => {
+test('AC-2 a cmux schedule follows its agent process across /clear and pauses when the process is replaced', async t => {
   const store = await fixture(t), uuid = '12345678-1234-1234-1234-123456789abc';
-  await store.put({ ...spec(), target: { type: 'cmux', workspace: uuid, surface: uuid, session: 'old-session', prompt: 'check' } });
-  const calls = [];
-  const execute = (target, options) => dispatch(target, { ...options, execute: async argv => { calls.push(argv); return { code: 0, output: argv[1] === 'sessions' ? JSON.stringify({ sessions: [{ surface_id: uuid, session_id: 'new-session', stored_pid_exists: true }] }) : uuid }; } });
-  const [run] = await store.tick({ execute });
-  assert.equal(run.receiverGone, true); assert.equal(calls.length, 2);
+  const agent = { pid: 4242, startedAt: 'Thu Nov 26 10:00:00 2026' };
+  await store.put({ ...spec(), trigger: { everyMs: 1000 }, target: { type: 'cmux', workspace: uuid, surface: uuid, agent, prompt: 'check' } });
+  let record = { surface_id: uuid, session_id: 'after-clear', pid: 4242, stored_pid_exists: true }, sent = 0;
+  const execute = (target, options) => dispatch(target, { ...options, execute: async argv => {
+    if (argv[0] === 'ps') return { code: 0, output: `${record.pid} ${record.pid === 4242 ? agent.startedAt : 'Thu Nov 26 11:00:00 2026'}\n` };
+    if (argv[1] === 'sessions') return { code: 0, output: JSON.stringify({ sessions: [record] }) };
+    if (argv[1] === 'rpc') sent++;
+    return { code: 0, output: uuid };
+  } });
+  const now = Date.now() + 2000;
+  assert.equal((await store.tick({ now, execute }))[0].status, 'transport-accepted');
+  assert.equal(sent, 1);
+  record = { ...record, session_id: 'new-process', pid: 5151 };
+  const [run] = await store.tick({ now: now + 2000, execute });
+  assert.equal(run.receiverGone, true); assert.equal(sent, 1);
   assert.equal((await store.list())[0].spec.enabled, false);
+});
+
+test('AC-2 a closed cmux workspace counts as an absent receiver', async () => {
+  const uuid = '12345678-1234-1234-1234-123456789abc';
+  const result = await dispatch({ type: 'cmux', workspace: uuid, surface: uuid, prompt: 'x' }, { execute: async () => ({ code: 1, output: 'Error: not_found: Workspace not found' }) });
+  assert.equal(result.receiverGone, true);
+  await assert.rejects(dispatch({ type: 'tmux', socket: '/tmp/s', pane: '%1', agent: { pid: 1, startedAt: 'x' }, prompt: 'x' }), /Unknown target/);
 });
 
 test('AC-1 editing a one-shot that already ran does not dispatch it again', async t => {
@@ -209,10 +226,12 @@ test('AC-3 session end removes schedules addressed to that terminal only', async
   const receivers = await currentReceivers({ CMUX_WORKSPACE_ID: uuid.toUpperCase(), CMUX_SURFACE_ID: uuid.toUpperCase() });
   assert.deepEqual(await store.removeForReceivers(receivers), [{ id: 'mine', removed: true }]);
   assert.deepEqual((await store.list()).map(e => e.spec.id), ['command', 'theirs']);
-  // A child agent process in the same terminal does not end a schedule bound to the receiving session.
-  await store.put({ ...spec('bound'), target: { type: 'cmux', workspace: uuid, surface: uuid, session: 'receiver', prompt: 'check' } });
-  assert.deepEqual(await store.removeForReceivers(receivers, 'child'), []);
-  assert.deepEqual(await store.removeForReceivers(receivers, 'receiver'), [{ id: 'bound', removed: true }]);
+  // Another agent process ending in the same terminal does not end a schedule bound to the receiving process.
+  const agent = { pid: 4242, startedAt: 'Thu Nov 26 10:00:00 2026' };
+  await store.put({ ...spec('bound'), target: { type: 'cmux', workspace: uuid, surface: uuid, agent, prompt: 'check' } });
+  assert.deepEqual(await store.removeForReceivers(receivers, { pid: 5151, startedAt: agent.startedAt }), []);
+  assert.deepEqual(await store.removeForReceivers(receivers, null), []);
+  assert.deepEqual(await store.removeForReceivers(receivers, { ...agent }), [{ id: 'bound', removed: true }]);
 });
 
 test('AC-3 session-end hook keeps schedules on /clear and /resume', async t => {

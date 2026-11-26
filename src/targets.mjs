@@ -10,6 +10,13 @@ const absolute = (v, name) => { text(v, name); if (!isAbsolute(v)) throw new Err
 const shell = /^-?(sh|bash|zsh|fish|dash|ksh|tcsh|csh|nu|pwsh)$/;
 // Receiver absence pauses a schedule; a failed check (abort, timeout, manager down) does not.
 const gone = message => Object.assign(new Error(message), { receiverGone: true });
+// An agent process is identified by PID plus start time, so a reused PID never matches.
+async function processStarts(call, pids) {
+  if (!pids.length) return new Map();
+  const { output } = await call(['ps', '-o', 'pid=,lstart=', '-p', pids.join(',')], { env: { ...process.env, LC_ALL: 'C' } }).catch(error => ({ output: error.output ?? '' }));
+  return new Map(output.split('\n').map(line => line.trim().match(/^(\d+)\s+(.+)$/)).filter(Boolean).map(([, pid, start]) => [Number(pid), start.trim()]));
+}
+const liveRecords = (sessions, surface) => sessions.filter(r => r.surface_id?.toLowerCase() === surface.toLowerCase() && r.stored_pid_exists === true);
 const json = output => { try { return JSON.parse(output); } catch { return null; } };
 
 // Terminal managers differ in addressing and transport; the scheduler contract is the same for every
@@ -17,16 +24,22 @@ const json = output => { try { return JSON.parse(output); } catch { return null;
 export const terminals = {
   cmux: {
     fields: ['workspace', 'surface'],
+    optional: ['agent'],
     validate(t) { if (![t.surface, t.workspace].every(v => typeof v === 'string' && uuid.test(v))) throw new Error('cmux requires surface and workspace UUIDs'); },
     key: t => [t.workspace, t.surface],
     async verify(call, t) {
-      const listed = await call(['cmux', '--id-format', 'uuids', 'tree', '--workspace', t.workspace]);
+      const listed = await call(['cmux', '--id-format', 'uuids', 'tree', '--workspace', t.workspace]).catch(error => error);
+      if (listed instanceof Error) throw /not_found/.test(listed.message) ? gone(listed.message) : listed;
       if (!listed.output.toLowerCase().includes(t.surface.toLowerCase())) throw gone('cmux surface is absent from the declared workspace');
       // Agent hooks record every Claude/Codex session per surface; no live record means the session ended.
       const sessions = json((await call(['cmux', 'sessions', 'list', '--surface', t.surface, '--json', '--all'])).output)?.sessions ?? [];
-      const live = sessions.filter(r => r.surface_id?.toLowerCase() === t.surface.toLowerCase() && r.stored_pid_exists === true);
+      const live = liveRecords(sessions, t.surface);
       if (!live.length) throw gone('No live agent session on the cmux surface');
-      if (t.session && !live.some(r => r.session_id?.toLowerCase() === t.session.toLowerCase())) throw gone('The registered agent session no longer runs on the cmux surface');
+      // /clear and /resume change the session id but keep the agent process; bind to the process.
+      if (t.agent) {
+        const starts = await processStarts(call, [t.agent.pid]);
+        if (!live.some(r => r.pid === t.agent.pid) || starts.get(t.agent.pid) !== t.agent.startedAt) throw gone('The registered agent process no longer runs on the cmux surface');
+      }
     },
     async submit(call, t, prompt) {
       // The send CLI expands backslash-n/r/t. RPC sends literal text.
@@ -39,11 +52,13 @@ export const terminals = {
     async list(call) {
       const tree = json((await call(['cmux', '--id-format', 'uuids', 'tree', '--all', '--json'])).output);
       const sessions = json((await call(['cmux', 'sessions', 'list', '--json', '--all']).catch(() => ({ output: '' }))).output)?.sessions ?? [];
+      const starts = await processStarts(call, [...new Set(sessions.filter(r => r.stored_pid_exists === true && Number.isSafeInteger(r.pid)).map(r => r.pid))]);
       const rows = [];
       for (const w of tree?.windows ?? []) for (const ws of w.workspaces ?? []) for (const pane of ws.panes ?? []) for (const s of pane.surfaces ?? []) {
         if (s.type !== 'terminal') continue;
-        const session = sessions.filter(r => r.surface_id?.toLowerCase() === s.id.toLowerCase() && r.stored_pid_exists === true).sort((a, b) => (b.updated_at_unix ?? 0) - (a.updated_at_unix ?? 0))[0];
-        rows.push({ target: { type: 'cmux', workspace: ws.id, surface: s.id, ...(session ? { session: session.session_id } : {}) }, label: s.title ?? s.id, group: ws.title ?? ws.id, live: !!session, agent: session?.agent ?? null, session: session?.session_id ?? null, cwd: session?.cwd ?? null });
+        const session = liveRecords(sessions, s.id).sort((a, b) => (b.updated_at_unix ?? 0) - (a.updated_at_unix ?? 0))[0];
+        const agent = session && starts.has(session.pid) ? { pid: session.pid, startedAt: starts.get(session.pid) } : null;
+        rows.push({ target: { type: 'cmux', workspace: ws.id, surface: s.id, ...(agent ? { agent } : {}) }, label: s.title ?? s.id, group: ws.title ?? ws.id, live: !!session, agent: session?.agent ?? null, session: session?.session_id ?? null, cwd: session?.cwd ?? null });
       }
       return rows;
     },
@@ -118,7 +133,7 @@ export function validateTarget(target) {
   if (!target || typeof target !== 'object' || Array.isArray(target)) throw new Error('target must be an object');
   if (target.type === 'codex-queue') throw new Error('codex-queue was removed; target the agent through its terminal (cmux, orca, or tmux)');
   const manager = terminals[target.type];
-  const allowed = target.type === 'command' ? ['type', 'argv', 'cwd'] : manager && ['type', ...manager.fields, 'session', 'mode', 'prompt'];
+  const allowed = target.type === 'command' ? ['type', 'argv', 'cwd'] : manager && ['type', ...manager.fields, ...(manager.optional ?? []), 'mode', 'prompt'];
   if (!allowed || Object.keys(target).some(k => !allowed.includes(k))) throw new Error('Unknown target type or field');
   if (target.type === 'command') {
     if (!Array.isArray(target.argv) || !target.argv.length) throw new Error('command.argv must be nonempty');
@@ -130,7 +145,11 @@ export function validateTarget(target) {
   if (target.prompt.includes('\t')) throw new Error('Tab control input is not allowed in prompts');
   if (target.prompt.length > 16000) throw new Error('prompt exceeds 16000 characters');
   if (target.mode !== undefined && !['prompt', 'goal'].includes(target.mode)) throw new Error('mode must be prompt or goal');
-  if (target.session !== undefined && (typeof target.session !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(target.session))) throw new Error('Invalid agent session id');
+  if (target.agent !== undefined) {
+    const a = target.agent;
+    if (!a || typeof a !== 'object' || Object.keys(a).some(k => !['pid', 'startedAt'].includes(k)) || !Number.isSafeInteger(a.pid) || a.pid < 1) throw new Error('agent requires pid and startedAt');
+    text(a.startedAt, 'agent startedAt');
+  }
   manager.validate(target);
   return target;
 }
@@ -222,3 +241,14 @@ export async function currentReceivers(env = process.env, options = {}) {
 }
 
 export const sameReceiver = (a, b) => a.type === b.type && a.type !== 'command' && terminals[a.type].fields.every(f => String(a[f]).toLowerCase() === String(b[f]).toLowerCase());
+
+// The agent process behind a hook's session id; cmux records every Claude/Codex session with its PID.
+export async function agentForSession(sessionId, options = {}) {
+  if (typeof sessionId !== 'string' || !sessionId) return null;
+  const call = caller({ timeoutMs: 5000, maxOutput: 1 << 20, ...options });
+  const sessions = json((await call(['cmux', 'sessions', 'list', '--session', sessionId, '--json', '--all']).catch(() => ({ output: '' }))).output)?.sessions ?? [];
+  const record = sessions.find(r => r.session_id?.toLowerCase() === sessionId.toLowerCase() && Number.isSafeInteger(r.pid));
+  if (!record) return null;
+  const startedAt = (await processStarts(call, [record.pid])).get(record.pid);
+  return startedAt ? { pid: record.pid, startedAt } : null;
+}

@@ -219,7 +219,7 @@ async function refresh() {
     }
   } catch (error) { fail(error); }
 }
-const receiverKey = ({ prompt, mode, session, ...rest }) => JSON.stringify(rest).toLowerCase();
+const receiverKey = ({ prompt, mode, agent, ...rest }) => JSON.stringify(rest).toLowerCase();
 async function remember(promise) {
   const groups = await promise;
   receivers = new Map(groups.flatMap(g => g.terminals.map(x => [receiverKey(x.target), x])));

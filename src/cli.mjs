@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Store } from './core.mjs';
-import { currentReceivers, listTerminals } from './targets.mjs';
+import { agentForSession, currentReceivers, listTerminals } from './targets.mjs';
 import { createUi, history, status } from './ui.mjs';
 
 const args = process.argv.slice(2);
@@ -48,7 +48,8 @@ try {
     if (['clear', 'resume'].includes(hook.reason)) print({ skipped: hook.reason });
     else {
       const receivers = await currentReceivers();
-      print({ receivers, session: hook.session_id ?? null, schedules: receivers.length ? await store.removeForReceivers(receivers, hook.session_id) : [] });
+      const agent = receivers.length ? await agentForSession(hook.session_id) : null;
+      print({ receivers, agent, schedules: receivers.length ? await store.removeForReceivers(receivers, agent) : [] });
     }
   } else if (command === 'ui') {
     const { server, token } = createUi(store);

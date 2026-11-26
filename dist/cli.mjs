@@ -820,6 +820,12 @@ var absolute = (v2, name) => {
 };
 var shell = /^-?(sh|bash|zsh|fish|dash|ksh|tcsh|csh|nu|pwsh)$/;
 var gone = (message) => Object.assign(new Error(message), { receiverGone: true });
+async function processStarts(call, pids) {
+  if (!pids.length) return /* @__PURE__ */ new Map();
+  const { output } = await call(["ps", "-o", "pid=,lstart=", "-p", pids.join(",")], { env: { ...process.env, LC_ALL: "C" } }).catch((error) => ({ output: error.output ?? "" }));
+  return new Map(output.split("\n").map((line) => line.trim().match(/^(\d+)\s+(.+)$/)).filter(Boolean).map(([, pid, start]) => [Number(pid), start.trim()]));
+}
+var liveRecords = (sessions, surface) => sessions.filter((r) => r.surface_id?.toLowerCase() === surface.toLowerCase() && r.stored_pid_exists === true);
 var json = (output) => {
   try {
     return JSON.parse(output);
@@ -830,17 +836,22 @@ var json = (output) => {
 var terminals = {
   cmux: {
     fields: ["workspace", "surface"],
+    optional: ["agent"],
     validate(t) {
       if (![t.surface, t.workspace].every((v2) => typeof v2 === "string" && uuid.test(v2))) throw new Error("cmux requires surface and workspace UUIDs");
     },
     key: (t) => [t.workspace, t.surface],
     async verify(call, t) {
-      const listed = await call(["cmux", "--id-format", "uuids", "tree", "--workspace", t.workspace]);
+      const listed = await call(["cmux", "--id-format", "uuids", "tree", "--workspace", t.workspace]).catch((error) => error);
+      if (listed instanceof Error) throw /not_found/.test(listed.message) ? gone(listed.message) : listed;
       if (!listed.output.toLowerCase().includes(t.surface.toLowerCase())) throw gone("cmux surface is absent from the declared workspace");
       const sessions = json((await call(["cmux", "sessions", "list", "--surface", t.surface, "--json", "--all"])).output)?.sessions ?? [];
-      const live = sessions.filter((r) => r.surface_id?.toLowerCase() === t.surface.toLowerCase() && r.stored_pid_exists === true);
+      const live = liveRecords(sessions, t.surface);
       if (!live.length) throw gone("No live agent session on the cmux surface");
-      if (t.session && !live.some((r) => r.session_id?.toLowerCase() === t.session.toLowerCase())) throw gone("The registered agent session no longer runs on the cmux surface");
+      if (t.agent) {
+        const starts = await processStarts(call, [t.agent.pid]);
+        if (!live.some((r) => r.pid === t.agent.pid) || starts.get(t.agent.pid) !== t.agent.startedAt) throw gone("The registered agent process no longer runs on the cmux surface");
+      }
     },
     async submit(call, t, prompt) {
       await call(["cmux", "rpc", "surface.send_text", JSON.stringify({ workspace_id: t.workspace, surface_id: t.surface, text: prompt })]);
@@ -854,11 +865,13 @@ var terminals = {
     async list(call) {
       const tree = json((await call(["cmux", "--id-format", "uuids", "tree", "--all", "--json"])).output);
       const sessions = json((await call(["cmux", "sessions", "list", "--json", "--all"]).catch(() => ({ output: "" }))).output)?.sessions ?? [];
+      const starts = await processStarts(call, [...new Set(sessions.filter((r) => r.stored_pid_exists === true && Number.isSafeInteger(r.pid)).map((r) => r.pid))]);
       const rows = [];
       for (const w2 of tree?.windows ?? []) for (const ws of w2.workspaces ?? []) for (const pane of ws.panes ?? []) for (const s of pane.surfaces ?? []) {
         if (s.type !== "terminal") continue;
-        const session = sessions.filter((r) => r.surface_id?.toLowerCase() === s.id.toLowerCase() && r.stored_pid_exists === true).sort((a, b2) => (b2.updated_at_unix ?? 0) - (a.updated_at_unix ?? 0))[0];
-        rows.push({ target: { type: "cmux", workspace: ws.id, surface: s.id, ...session ? { session: session.session_id } : {} }, label: s.title ?? s.id, group: ws.title ?? ws.id, live: !!session, agent: session?.agent ?? null, session: session?.session_id ?? null, cwd: session?.cwd ?? null });
+        const session = liveRecords(sessions, s.id).sort((a, b2) => (b2.updated_at_unix ?? 0) - (a.updated_at_unix ?? 0))[0];
+        const agent = session && starts.has(session.pid) ? { pid: session.pid, startedAt: starts.get(session.pid) } : null;
+        rows.push({ target: { type: "cmux", workspace: ws.id, surface: s.id, ...agent ? { agent } : {} }, label: s.title ?? s.id, group: ws.title ?? ws.id, live: !!session, agent: session?.agent ?? null, session: session?.session_id ?? null, cwd: session?.cwd ?? null });
       }
       return rows;
     }
@@ -937,7 +950,7 @@ function validateTarget(target) {
   if (!target || typeof target !== "object" || Array.isArray(target)) throw new Error("target must be an object");
   if (target.type === "codex-queue") throw new Error("codex-queue was removed; target the agent through its terminal (cmux, orca, or tmux)");
   const manager = terminals[target.type];
-  const allowed = target.type === "command" ? ["type", "argv", "cwd"] : manager && ["type", ...manager.fields, "session", "mode", "prompt"];
+  const allowed = target.type === "command" ? ["type", "argv", "cwd"] : manager && ["type", ...manager.fields, ...manager.optional ?? [], "mode", "prompt"];
   if (!allowed || Object.keys(target).some((k2) => !allowed.includes(k2))) throw new Error("Unknown target type or field");
   if (target.type === "command") {
     if (!Array.isArray(target.argv) || !target.argv.length) throw new Error("command.argv must be nonempty");
@@ -949,7 +962,11 @@ function validateTarget(target) {
   if (target.prompt.includes("	")) throw new Error("Tab control input is not allowed in prompts");
   if (target.prompt.length > 16e3) throw new Error("prompt exceeds 16000 characters");
   if (target.mode !== void 0 && !["prompt", "goal"].includes(target.mode)) throw new Error("mode must be prompt or goal");
-  if (target.session !== void 0 && (typeof target.session !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(target.session))) throw new Error("Invalid agent session id");
+  if (target.agent !== void 0) {
+    const a = target.agent;
+    if (!a || typeof a !== "object" || Object.keys(a).some((k2) => !["pid", "startedAt"].includes(k2)) || !Number.isSafeInteger(a.pid) || a.pid < 1) throw new Error("agent requires pid and startedAt");
+    text(a.startedAt, "agent startedAt");
+  }
   manager.validate(target);
   return target;
 }
@@ -1061,6 +1078,15 @@ async function currentReceivers(env = process.env, options = {}) {
   return found;
 }
 var sameReceiver = (a, b2) => a.type === b2.type && a.type !== "command" && terminals[a.type].fields.every((f2) => String(a[f2]).toLowerCase() === String(b2[f2]).toLowerCase());
+async function agentForSession(sessionId, options = {}) {
+  if (typeof sessionId !== "string" || !sessionId) return null;
+  const call = caller({ timeoutMs: 5e3, maxOutput: 1 << 20, ...options });
+  const sessions = json((await call(["cmux", "sessions", "list", "--session", sessionId, "--json", "--all"]).catch(() => ({ output: "" }))).output)?.sessions ?? [];
+  const record = sessions.find((r) => r.session_id?.toLowerCase() === sessionId.toLowerCase() && Number.isSafeInteger(r.pid));
+  if (!record) return null;
+  const startedAt = (await processStarts(call, [record.pid])).get(record.pid);
+  return startedAt ? { pid: record.pid, startedAt } : null;
+}
 
 // src/core.mjs
 var idPattern = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
@@ -1210,12 +1236,12 @@ var Store = class {
       return { id, removed: true };
     });
   }
-  async removeForReceivers(receivers, session) {
+  async removeForReceivers(receivers, agent) {
     return this.lock("store", async () => {
       const result = [];
       for (const { spec, state } of await this.list()) {
         if (!receivers.some((r) => sameReceiver(spec.target, r))) continue;
-        if (spec.target.session && spec.target.session.toLowerCase() !== session?.toLowerCase()) continue;
+        if (spec.target.agent && (spec.target.agent.pid !== agent?.pid || spec.target.agent.startedAt !== agent?.startedAt)) continue;
         if (state?.pending) {
           await this.atomic(this.path("schedules", spec.id), { ...spec, enabled: false });
           result.push({ id: spec.id, paused: true, pending: state.pending });
@@ -1513,7 +1539,7 @@ async function refresh() {
     }
   } catch (error) { fail(error); }
 }
-const receiverKey = ({ prompt, mode, session, ...rest }) => JSON.stringify(rest).toLowerCase();
+const receiverKey = ({ prompt, mode, agent, ...rest }) => JSON.stringify(rest).toLowerCase();
 async function remember(promise) {
   const groups = await promise;
   receivers = new Map(groups.flatMap(g => g.terminals.map(x => [receiverKey(x.target), x])));
@@ -1737,7 +1763,8 @@ No API key or model process is required.`);
     if (["clear", "resume"].includes(hook.reason)) print({ skipped: hook.reason });
     else {
       const receivers = await currentReceivers();
-      print({ receivers, session: hook.session_id ?? null, schedules: receivers.length ? await store.removeForReceivers(receivers, hook.session_id) : [] });
+      const agent = receivers.length ? await agentForSession(hook.session_id) : null;
+      print({ receivers, agent, schedules: receivers.length ? await store.removeForReceivers(receivers, agent) : [] });
     }
   } else if (command === "ui") {
     const { server, token } = createUi(store);

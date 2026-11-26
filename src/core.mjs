@@ -132,13 +132,13 @@ export class Store {
       return { id, removed: true };
     });
   }
-  async removeForReceivers(receivers, session) {
+  async removeForReceivers(receivers, agent) {
     return this.lock('store', async () => {
       const result = [];
       for (const { spec, state } of await this.list()) {
         if (!receivers.some(r => sameReceiver(spec.target, r))) continue;
-        // A schedule bound to an agent session ends only with that session, not with another process in the terminal.
-        if (spec.target.session && spec.target.session.toLowerCase() !== session?.toLowerCase()) continue;
+        // A schedule bound to an agent process ends only with that process, not with another one in the terminal.
+        if (spec.target.agent && (spec.target.agent.pid !== agent?.pid || spec.target.agent.startedAt !== agent?.startedAt)) continue;
         // A pending run needs inspection before removal; stop further dispatch meanwhile.
         if (state?.pending) { await this.atomic(this.path('schedules', spec.id), { ...spec, enabled: false }); result.push({ id: spec.id, paused: true, pending: state.pending }); }
         else { await rm(this.path('schedules', spec.id)); result.push({ id: spec.id, removed: true }); }
