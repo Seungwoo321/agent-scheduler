@@ -1,12 +1,12 @@
 # Agent Scheduler
 
-A standalone, file-based scheduler for local commands and prompts to existing agent sessions. Claude Code and Codex plugins use the same Node.js engine and local schedule files. No model API, relay, database, HTTP service, or other agent plugin is required.
+A standalone, file-based scheduler for local commands and prompts to existing agent sessions. Claude Code and Codex plugins use the same Node.js engine and local schedule files. No model API, relay, database, or other agent plugin is required. Delivery does not depend on which coding agent CLI runs in the receiving terminal or on that agent's own scheduling features.
 
 Timer ticks do not use model tokens. Delivered prompts can start real model work and consume quota. Use a small command for mechanical checks and wake a supervisor when judgment is needed.
 
 ## Install
 
-Requires Node.js 22 or newer, plus the executable for the selected target (`cmux`, `tmux`, or `codex`). Command schedules work without a terminal manager.
+Requires Node.js 22 or newer, plus the terminal manager for the selected target (`cmux`, `orca`, or `tmux`). Command schedules work without a terminal manager.
 
 Claude Code:
 
@@ -29,7 +29,7 @@ Start a new Codex session to discover the plugin's `schedule` skill. Both provid
 Standalone CLI from a [GitHub release](https://github.com/Seungwoo321/agent-scheduler/releases):
 
 ```sh
-npm install -g ./seungwoo321-agent-scheduler-0.1.0.tgz
+npm install -g ./seungwoo321-agent-scheduler-0.2.0.tgz
 agent-scheduler --help
 ```
 
@@ -62,6 +62,7 @@ agent-scheduler start
 agent-scheduler list
 agent-scheduler history
 agent-scheduler pause local-check
+agent-scheduler ui
 agent-scheduler remove local-check
 agent-scheduler stop
 ```
@@ -74,10 +75,14 @@ The plugin skill runs these commands with `node <installed-plugin>/dist/cli.mjs`
 | --- | --- | --- |
 | `command` | Executable and argument array, no shell | Command exited zero |
 | `cmux` | Literal text RPC to workspace/surface UUID, then Enter | Transport accepted |
+| `orca` | `orca terminal send --enter` to a runtime terminal handle | Transport accepted |
 | `tmux` | Literal text to an exact pane, then Enter | Transport accepted |
-| `codex-queue` | Existing thread in its declared credential home | Queue accepted |
 
-Transport acceptance does **not** prove a model turn started or finished. Terminal targets need dedicated receivers: do not target unfinished user input or a pane whose process has been replaced. Codex queueing never creates a replacement model session. The engine does not judge tasks, merge PRs, or mark work complete.
+Every terminal target is verified before input: the terminal must exist and a coding agent must still run in it. Otherwise nothing is typed and the daemon pauses the schedule. `mode: "goal"` delivers the prompt as `/goal <prompt>` for Claude Code and Codex alike. When a receiving session ends, the plugin's `SessionEnd` hook removes the schedules addressed to its terminal.
+
+Prompts are written at registration from the actual task context and stored verbatim, so every delivered instruction is readable in the definition and receipts. Transport acceptance does **not** prove a model turn started or finished. The engine does not judge tasks, merge PRs, or mark work complete.
+
+`agent-scheduler ui` serves a local management page; see [the schema](docs/schedules.md#management-page).
 
 ## Reliability
 

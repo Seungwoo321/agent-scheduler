@@ -3,7 +3,7 @@ import { join, resolve } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { hostname } from 'node:os';
 import { Cron } from 'croner';
-import { dispatch, targetKey, validateTarget } from './targets.mjs';
+import { dispatch, sameReceiver, targetKey, validateTarget } from './targets.mjs';
 
 const idPattern = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const iso = value => new Date(value).toISOString();
@@ -130,6 +130,18 @@ export class Store {
       return { id, removed: true };
     });
   }
+  async removeForReceivers(receivers) {
+    return this.lock('store', async () => {
+      const result = [];
+      for (const { spec, state } of await this.list()) {
+        if (!receivers.some(r => sameReceiver(spec.target, r))) continue;
+        // A pending run needs inspection before removal; stop further dispatch meanwhile.
+        if (state?.pending) { await this.atomic(this.path('schedules', spec.id), { ...spec, enabled: false }); result.push({ id: spec.id, paused: true, pending: state.pending }); }
+        else { await rm(this.path('schedules', spec.id)); result.push({ id: spec.id, removed: true }); }
+      }
+      return result;
+    });
+  }
   async resolveRun(id, runId) {
     return this.lock('store', async () => {
       const state = await this.read(this.path('state', id));
@@ -177,6 +189,9 @@ export class Store {
       await this.lock('store', async () => {
         await this.atomic(this.path('runs', receipt.runId), { ...receipt, ...result, finishedAt: iso(Date.now()) });
         const state = await this.read(this.path('state', spec.id));
+        // The receiver ended without removing its schedule; pause instead of retrying an absent session.
+        const current = result.status === 'not-delivered' && await this.read(this.path('schedules', spec.id));
+        if (current?.enabled) await this.atomic(this.path('schedules', spec.id), { ...current, enabled: false });
         if (state?.pending === receipt.runId && result.status !== 'uncertain') {
           delete state.pending;
           await this.atomic(this.path('state', spec.id), state);

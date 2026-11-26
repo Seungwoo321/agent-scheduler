@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 // src/cli.mjs
-import { readFile as readFile2, readdir as readdir2, open as open2 } from "node:fs/promises";
-import { join as join2 } from "node:path";
+import { readFile as readFile3, open as open2 } from "node:fs/promises";
+import { join as join3 } from "node:path";
 import { homedir } from "node:os";
 import { spawn as spawn2 } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -810,46 +810,147 @@ var A = class {
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
+var uuid = /^[0-9a-f]{8}-[0-9a-f-]{27}$/i;
 var text = (v2, name) => {
   if (typeof v2 !== "string" || !v2.trim() || /[\x00-\x08\x0b-\x1f\x7f]/.test(v2)) throw new Error(`Invalid ${name}`);
 };
+var absolute = (v2, name) => {
+  text(v2, name);
+  if (!isAbsolute(v2)) throw new Error(`${name} must be absolute`);
+};
+var shell = /^-?(sh|bash|zsh|fish|dash|ksh|tcsh|csh|nu|pwsh)$/;
+var json = (output) => {
+  try {
+    return JSON.parse(output);
+  } catch {
+    return null;
+  }
+};
+var terminals = {
+  cmux: {
+    fields: ["workspace", "surface"],
+    validate(t) {
+      if (![t.surface, t.workspace].every((v2) => typeof v2 === "string" && uuid.test(v2))) throw new Error("cmux requires surface and workspace UUIDs");
+    },
+    key: (t) => [t.workspace, t.surface],
+    async verify(call, t) {
+      const listed = await call(["cmux", "--id-format", "uuids", "tree", "--workspace", t.workspace]);
+      if (!listed.output.toLowerCase().includes(t.surface.toLowerCase())) throw new Error("cmux surface is absent from the declared workspace");
+      const sessions = json((await call(["cmux", "sessions", "list", "--surface", t.surface, "--json", "--all"])).output)?.sessions ?? [];
+      if (!sessions.some((r) => r.surface_id?.toLowerCase() === t.surface.toLowerCase() && r.stored_pid_exists === true)) throw new Error("No live agent session on the cmux surface");
+    },
+    async submit(call, t, prompt) {
+      await call(["cmux", "rpc", "surface.send_text", JSON.stringify({ workspace_id: t.workspace, surface_id: t.surface, text: prompt })]);
+      await new Promise((resolve2) => setTimeout(resolve2, 250));
+      await call(["cmux", "send-key", "--workspace", t.workspace, "--surface", t.surface, "Enter"]);
+    },
+    fromEnv: async (env) => env.CMUX_WORKSPACE_ID && env.CMUX_SURFACE_ID ? { workspace: env.CMUX_WORKSPACE_ID, surface: env.CMUX_SURFACE_ID } : null,
+    async read(call, t) {
+      return (await call(["cmux", "read-screen", "--workspace", t.workspace, "--surface", t.surface, "--lines", "40"])).output;
+    },
+    async list(call) {
+      const tree = json((await call(["cmux", "--id-format", "uuids", "tree", "--all", "--json"])).output);
+      const sessions = json((await call(["cmux", "sessions", "list", "--json", "--all"]).catch(() => ({ output: "" }))).output)?.sessions ?? [];
+      const rows = [];
+      for (const w2 of tree?.windows ?? []) for (const ws of w2.workspaces ?? []) for (const pane of ws.panes ?? []) for (const s of pane.surfaces ?? []) {
+        if (s.type !== "terminal") continue;
+        const session = sessions.filter((r) => r.surface_id?.toLowerCase() === s.id.toLowerCase() && r.stored_pid_exists === true).sort((a, b2) => (b2.updated_at_unix ?? 0) - (a.updated_at_unix ?? 0))[0];
+        rows.push({ target: { type: "cmux", workspace: ws.id, surface: s.id }, label: s.title ?? s.id, group: ws.title ?? ws.id, live: !!session, agent: session?.agent ?? null, session: session?.session_id ?? null, cwd: session?.cwd ?? null });
+      }
+      return rows;
+    }
+  },
+  orca: {
+    fields: ["terminal"],
+    validate(t) {
+      text(t.terminal, "orca terminal handle");
+      if (t.terminal.length > 256) throw new Error("orca terminal handle is too long");
+    },
+    key: (t) => [t.terminal],
+    async verify(call, t) {
+      const shown = json((await call(["orca", "terminal", "show", "--terminal", t.terminal, "--json"])).output);
+      if (shown?.ok === false) throw new Error(`orca terminal unavailable (${shown.error?.code ?? "unknown"})`);
+      const terminal = shown?.result?.terminal ?? shown?.result ?? shown;
+      if (!terminal?.agentIdentity) throw new Error("No running agent in the orca terminal");
+    },
+    async submit(call, t, prompt) {
+      const sent = json((await call(["orca", "terminal", "send", "--terminal", t.terminal, "--text", prompt, "--enter", "--json"])).output);
+      if (sent?.ok === false) throw new Error(`orca send failed (${sent.error?.code ?? "unknown"})`);
+    },
+    async fromEnv(env, call) {
+      if (!env.ORCA_PANE_KEY) return null;
+      const listed = json((await call(["orca", "terminal", "list", "--json"])).output);
+      const row = (listed?.result?.terminals ?? listed?.terminals ?? []).find((r) => `${r.tabId}:${r.leafId}` === env.ORCA_PANE_KEY);
+      return row?.handle ? { terminal: row.handle } : null;
+    },
+    async read(call, t) {
+      const read = json((await call(["orca", "terminal", "read", "--terminal", t.terminal, "--screen", "--json"])).output);
+      if (read?.ok === false) throw new Error(read.error?.message ?? "orca terminal read failed");
+      const result = read?.result ?? read;
+      return typeof result === "string" ? result : result?.screen ?? result?.text ?? JSON.stringify(result, null, 2);
+    },
+    async list(call) {
+      const listed = json((await call(["orca", "terminal", "list", "--json"])).output);
+      if (listed?.ok === false) throw new Error(listed.error?.message ?? "orca terminal list failed");
+      const rows = listed?.result?.terminals ?? listed?.terminals ?? [];
+      return rows.filter((r) => typeof r.handle === "string").map((r) => ({ target: { type: "orca", terminal: r.handle }, label: r.paneTitle || r.title || r.handle, group: r.worktreePath ?? r.worktree ?? null, live: !!r.agentIdentity, agent: r.agentIdentity ?? null, session: null, cwd: r.cwd ?? r.worktreePath ?? null }));
+    }
+  },
+  tmux: {
+    fields: ["socket", "pane"],
+    validate(t) {
+      if (!/^%\d+$/.test(t.pane)) throw new Error("tmux requires an exact %pane id");
+      absolute(t.socket, "tmux socket");
+    },
+    key: (t) => [t.socket, t.pane],
+    async verify(call, t) {
+      const listed = await call(["tmux", "-S", t.socket, "display-message", "-p", "-t", t.pane, "#{pane_id}	#{pane_current_command}"]);
+      const [pane, command2] = listed.output.trim().split("	");
+      if (pane !== t.pane) throw new Error("tmux pane identity mismatch");
+      if (shell.test(command2 ?? "")) throw new Error("No running agent in the tmux pane");
+    },
+    async submit(call, t, prompt) {
+      await call(["tmux", "-S", t.socket, "send-keys", "-t", t.pane, "-l", "--", prompt]);
+      await new Promise((resolve2) => setTimeout(resolve2, 250));
+      await call(["tmux", "-S", t.socket, "send-keys", "-t", t.pane, "Enter"]);
+    },
+    fromEnv: async (env) => env.TMUX && env.TMUX_PANE ? { socket: env.TMUX.split(",")[0], pane: env.TMUX_PANE } : null,
+    async read(call, t) {
+      return (await call(["tmux", "-S", t.socket, "capture-pane", "-p", "-t", t.pane, "-S", "-40"])).output;
+    },
+    async list(call) {
+      const { output } = await call(["tmux", "list-panes", "-a", "-F", "#{socket_path}	#{pane_id}	#{session_name}:#{window_index}.#{pane_index}	#{pane_current_command}	#{pane_current_path}"]);
+      return output.split("\n").filter(Boolean).map((line) => {
+        const [socket, pane, name, command2, cwd] = line.split("	");
+        return { target: { type: "tmux", socket, pane }, label: `${name} ${command2}`, group: socket, live: !shell.test(command2), agent: null, session: null, cwd };
+      });
+    }
+  }
+};
 function validateTarget(target) {
   if (!target || typeof target !== "object" || Array.isArray(target)) throw new Error("target must be an object");
-  const allowed = {
-    command: ["type", "argv", "cwd"],
-    cmux: ["type", "surface", "workspace", "prompt"],
-    tmux: ["type", "socket", "pane", "prompt"],
-    "codex-queue": ["type", "thread", "home", "prompt"]
-  }[target.type];
+  if (target.type === "codex-queue") throw new Error("codex-queue was removed; target the agent through its terminal (cmux, orca, or tmux)");
+  const manager = terminals[target.type];
+  const allowed = target.type === "command" ? ["type", "argv", "cwd"] : manager && ["type", ...manager.fields, "mode", "prompt"];
   if (!allowed || Object.keys(target).some((k2) => !allowed.includes(k2))) throw new Error("Unknown target type or field");
   if (target.type === "command") {
     if (!Array.isArray(target.argv) || !target.argv.length) throw new Error("command.argv must be nonempty");
     target.argv.forEach((v2) => text(v2, "argument"));
-    text(target.cwd, "cwd");
-    if (!isAbsolute(target.cwd)) throw new Error("cwd must be absolute");
-  } else {
-    text(target.prompt, "prompt");
-    if (target.prompt.includes("	")) throw new Error("Tab control input is not allowed in prompts");
-    if (target.prompt.length > 16e3) throw new Error("prompt exceeds 16000 characters");
-    if (target.type === "cmux") {
-      if (![target.surface, target.workspace].every((v2) => typeof v2 === "string" && /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(v2))) throw new Error("cmux requires surface and workspace UUIDs");
-    } else if (target.type === "tmux") {
-      if (!/^%\d+$/.test(target.pane)) throw new Error("tmux requires an exact %pane id");
-      text(target.socket, "tmux socket");
-      if (!isAbsolute(target.socket)) throw new Error("tmux socket must be absolute");
-    } else {
-      if (typeof target.thread !== "string" || !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(target.thread)) throw new Error("Codex requires a thread UUID");
-      text(target.home, "Codex home");
-      if (!isAbsolute(target.home)) throw new Error("Codex home must be absolute");
-    }
+    absolute(target.cwd, "cwd");
+    return target;
   }
+  text(target.prompt, "prompt");
+  if (target.prompt.includes("	")) throw new Error("Tab control input is not allowed in prompts");
+  if (target.prompt.length > 16e3) throw new Error("prompt exceeds 16000 characters");
+  if (target.mode !== void 0 && !["prompt", "goal"].includes(target.mode)) throw new Error("mode must be prompt or goal");
+  manager.validate(target);
   return target;
 }
 function targetKey(t) {
-  const key = t.type === "command" ? [t.type, t.argv, t.cwd] : t.type === "cmux" ? [t.type, t.workspace, t.surface] : t.type === "tmux" ? [t.type, t.socket, t.pane] : [t.type, t.home, t.thread];
+  const key = t.type === "command" ? [t.type, t.argv, t.cwd] : [t.type, ...terminals[t.type].key(t)];
   return createHash("sha256").update(JSON.stringify(key)).digest("hex");
 }
-function processCommand(argv, { cwd, env = process.env, timeoutMs = 3e4, signal } = {}) {
+function processCommand(argv, { cwd, env = process.env, timeoutMs = 3e4, signal, maxOutput = 65536 } = {}) {
   return new Promise((resolve2, reject) => {
     const child = spawn(argv[0], argv.slice(1), { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
     let output = "", timedOut = false, aborted = false;
@@ -877,7 +978,7 @@ function processCommand(argv, { cwd, env = process.env, timeoutMs = 3e4, signal 
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
     for (const stream of [child.stdout, child.stderr]) stream.on("data", (chunk) => {
-      output = (output + chunk).slice(-65536);
+      output = (output + chunk).slice(-maxOutput);
     });
     const cleanup = () => {
       clearTimeout(timer);
@@ -900,38 +1001,59 @@ function processCommand(argv, { cwd, env = process.env, timeoutMs = 3e4, signal 
     });
   });
 }
-async function dispatch(target, options = {}) {
-  validateTarget(target);
+var caller = (options = {}) => {
   const execute = options.execute ?? processCommand;
-  const call = async (argv, extra = {}) => {
+  return async (argv, extra = {}) => {
     if (options.signal?.aborted) throw new Error("Dispatch aborted");
     const result = await execute(argv, { ...options, ...extra });
-    if (result.code !== 0 || result.timedOut || result.aborted) throw new Error(`Transport failed (${result.timedOut ? "timeout" : result.aborted ? "aborted" : result.code})`);
+    if (result.code !== 0 || result.timedOut || result.aborted) {
+      const detail = json(result.output ?? "")?.error?.message ?? result.output?.trim().split("\n").at(-1);
+      throw new Error(`Transport failed (${result.timedOut ? "timeout" : result.aborted ? "aborted" : result.code})${detail ? `: ${detail.slice(0, 300)}` : ""}`);
+    }
     return result;
   };
+};
+async function dispatch(target, options = {}) {
+  validateTarget(target);
+  const call = caller(options);
   if (target.type === "command") {
     await call(target.argv, { cwd: target.cwd });
     return { status: "succeeded", acknowledgment: "command-exited-zero" };
   }
-  const prompt = target.prompt.replace(/[\r\n]+/g, " ");
-  if (target.type === "cmux") {
-    const listed = await call(["cmux", "--id-format", "uuids", "tree", "--workspace", target.workspace]);
-    if (!listed.output.toLowerCase().includes(target.surface.toLowerCase())) throw new Error("cmux surface is absent from the declared workspace");
-    await call(["cmux", "rpc", "surface.send_text", JSON.stringify({ workspace_id: target.workspace, surface_id: target.surface, text: prompt })]);
-    await new Promise((resolve2) => setTimeout(resolve2, 250));
-    await call(["cmux", "send-key", "--workspace", target.workspace, "--surface", target.surface, "Enter"]);
-  } else if (target.type === "tmux") {
-    const listed = await call(["tmux", "-S", target.socket, "display-message", "-p", "-t", target.pane, "#{pane_id}"]);
-    if (listed.output.trim() !== target.pane) throw new Error("tmux pane identity mismatch");
-    await call(["tmux", "-S", target.socket, "send-keys", "-t", target.pane, "-l", "--", prompt]);
-    await new Promise((resolve2) => setTimeout(resolve2, 250));
-    await call(["tmux", "-S", target.socket, "send-keys", "-t", target.pane, "Enter"]);
-  } else {
-    const result = await call(["codex", "queue", "--thread", target.thread, "--message", target.prompt], { env: { ...process.env, CODEX_HOME: target.home } });
-    if (/warning|failed/i.test(result.output ?? "")) throw new Error("Codex queue reported a warning; inspect the native queue before retrying");
+  const manager = terminals[target.type];
+  try {
+    await manager.verify(call, target);
+  } catch (error) {
+    return { status: "not-delivered", acknowledgment: "receiver-check-failed-before-input", error: error.message };
   }
+  const prompt = target.prompt.replace(/[\r\n]+/g, " ");
+  await manager.submit(call, target, target.mode === "goal" ? `/goal ${prompt}` : prompt);
   return { status: "transport-accepted", acknowledgment: "delivery-only-not-model-turn" };
 }
+async function listTerminals(options = {}) {
+  const call = caller({ timeoutMs: 1e4, maxOutput: 16 << 20, ...options });
+  return Promise.all(Object.entries(terminals).map(async ([type, manager]) => {
+    try {
+      return { type, available: true, terminals: await manager.list(call) };
+    } catch (error) {
+      return { type, available: false, error: error.code === "ENOENT" ? `${type} is not installed` : error.message, terminals: [] };
+    }
+  }));
+}
+async function readTerminal(target, options = {}) {
+  validateTarget({ ...target, prompt: "read" });
+  return terminals[target.type].read(caller({ timeoutMs: 1e4, maxOutput: 1 << 20, ...options }), target);
+}
+async function currentReceivers(env = process.env, options = {}) {
+  const call = caller({ timeoutMs: 5e3, maxOutput: 16 << 20, ...options });
+  const found = [];
+  for (const [type, manager] of Object.entries(terminals)) {
+    const ids = await manager.fromEnv(env, call).catch(() => null);
+    if (ids) found.push({ type, ...ids });
+  }
+  return found;
+}
+var sameReceiver = (a, b2) => a.type === b2.type && a.type !== "command" && terminals[a.type].fields.every((f2) => String(a[f2]).toLowerCase() === String(b2[f2]).toLowerCase());
 
 // src/core.mjs
 var idPattern = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
@@ -1080,6 +1202,22 @@ var Store = class {
       return { id, removed: true };
     });
   }
+  async removeForReceivers(receivers) {
+    return this.lock("store", async () => {
+      const result = [];
+      for (const { spec, state } of await this.list()) {
+        if (!receivers.some((r) => sameReceiver(spec.target, r))) continue;
+        if (state?.pending) {
+          await this.atomic(this.path("schedules", spec.id), { ...spec, enabled: false });
+          result.push({ id: spec.id, paused: true, pending: state.pending });
+        } else {
+          await rm(this.path("schedules", spec.id));
+          result.push({ id: spec.id, removed: true });
+        }
+      }
+      return result;
+    });
+  }
   async resolveRun(id, runId) {
     return this.lock("store", async () => {
       const state = await this.read(this.path("state", id));
@@ -1128,6 +1266,8 @@ var Store = class {
       await this.lock("store", async () => {
         await this.atomic(this.path("runs", receipt.runId), { ...receipt, ...result, finishedAt: iso(Date.now()) });
         const state = await this.read(this.path("state", spec.id));
+        const current = result.status === "not-delivered" && await this.read(this.path("schedules", spec.id));
+        if (current?.enabled) await this.atomic(this.path("schedules", spec.id), { ...current, enabled: false });
         if (state?.pending === receipt.runId && result.status !== "uncertain") {
           delete state.pending;
           await this.atomic(this.path("state", spec.id), state);
@@ -1138,18 +1278,406 @@ var Store = class {
   }
 };
 
+// src/ui.mjs
+import { createServer } from "node:http";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { readdir as readdir2, readFile as readFile2 } from "node:fs/promises";
+import { join as join2 } from "node:path";
+var page = true ? `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Scheduler</title>
+<style>
+  /* Primitive tokens */
+  :root {
+    --gray-0: #ffffff; --gray-50: #f6f7f9; --gray-200: #dfe2e7; --gray-400: #a3aab5; --gray-500: #5c6370; --gray-800: #23272e; --gray-900: #15181d; --gray-950: #0d0f12;
+    --blue-400: #6ea8ff; --blue-600: #1f5fd1; --red-400: #ff8a80; --red-600: #b3261e; --green-400: #6fd38f; --green-700: #1d7a3d; --amber-400: #f3c063; --amber-700: #8a5a00;
+    --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-6: 24px;
+    --radius: 6px; --font: system-ui, -apple-system, "Segoe UI", "Apple SD Gothic Neo", sans-serif; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  /* Semantic tokens; a theme changes only these values */
+  :root, :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: var(--gray-50); --surface: var(--gray-0); --border: var(--gray-200); --text: var(--gray-900); --muted: var(--gray-500);
+    --accent: var(--blue-600); --on-accent: var(--gray-0); --danger: var(--red-600); --ok: var(--green-700); --warn: var(--amber-700); --focus: var(--blue-600);
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: var(--gray-950); --surface: var(--gray-900); --border: var(--gray-800); --text: var(--gray-50); --muted: var(--gray-400);
+    --accent: var(--blue-400); --on-accent: var(--gray-950); --danger: var(--red-400); --ok: var(--green-400); --warn: var(--amber-400); --focus: var(--blue-400);
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 var(--font); }
+  main { max-width: 1200px; margin: 0 auto; padding: var(--space-6) var(--space-4); }
+  h1 { font-size: 20px; margin: 0; } h2 { font-size: 16px; margin: 0 0 var(--space-3); }
+  header { display: flex; gap: var(--space-4); align-items: center; flex-wrap: wrap; margin-bottom: var(--space-6); }
+  header .prefs { margin-left: auto; display: flex; gap: var(--space-3); }
+  header .prefs label { display: flex; align-items: center; gap: var(--space-2); }
+  section { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-4); margin-bottom: var(--space-6); overflow-x: auto; }
+  .muted { color: var(--muted); } .nowrap { white-space: nowrap; word-break: normal; } .mono { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+  table { width: 100%; border-collapse: collapse; } th, td { text-align: left; padding: var(--space-2); border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  .button { min-height: 32px; min-width: 32px; padding: 0 var(--space-3); border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); color: var(--text); font: inherit; cursor: pointer; }
+  .button[data-variant="primary"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  .button[data-variant="danger"] { color: var(--danger); border-color: var(--danger); }
+  .button:disabled { opacity: .5; cursor: not-allowed; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; scroll-margin: 80px; }
+  .actions { display: flex; gap: var(--space-2); flex-wrap: wrap; }
+  .badge { display: inline-block; padding: 0 var(--space-2); border-radius: 999px; border: 1px solid currentColor; font-size: 12px; white-space: nowrap; }
+  .badge[data-tone="ok"] { color: var(--ok); } .badge[data-tone="warn"] { color: var(--warn); } .badge[data-tone="danger"] { color: var(--danger); } .badge[data-tone="muted"] { color: var(--muted); }
+  label { display: grid; gap: var(--space-1); font-weight: 600; font-size: 13px; }
+  input, select, textarea { font: inherit; font-weight: 400; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-2); min-height: 32px; }
+  input[type="checkbox"] { min-height: 24px; min-width: 24px; }
+  textarea { min-height: 140px; resize: vertical; }
+  .grid { display: grid; gap: var(--space-4); grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+  .stack { display: grid; gap: var(--space-4); }
+  pre { margin: 0; padding: var(--space-3); background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); max-height: 320px; overflow: auto; font: 12px/1.4 var(--mono); white-space: pre-wrap; }
+  .prompt { white-space: pre-wrap; max-width: 420px; }
+  [role="alert"] { color: var(--danger); min-height: 1.5em; margin: 0 0 var(--space-3); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Agent Scheduler</h1><span id="status" class="muted" aria-live="polite"></span>
+    <div class="prefs">
+      <label><span data-i18n="language"></span><select id="lang"><option value="ko">\uD55C\uAD6D\uC5B4</option><option value="en">English</option></select></label>
+      <label><span data-i18n="theme"></span><select id="theme"><option value="system" data-i18n="themeSystem"></option><option value="light" data-i18n="themeLight"></option><option value="dark" data-i18n="themeDark"></option></select></label>
+    </div>
+  </header>
+  <p role="alert" id="error"></p>
+
+  <section aria-labelledby="schedules-title">
+    <div class="actions" style="justify-content: space-between"><h2 id="schedules-title" data-i18n="schedules"></h2>
+      <div class="actions"><button class="button" type="button" id="refresh" data-i18n="refresh"></button><button class="button" data-variant="primary" type="button" id="new" data-i18n="newSchedule"></button></div></div>
+    <table><thead><tr><th scope="col">ID</th><th scope="col" data-i18n="receiver"></th><th scope="col" data-i18n="prompt"></th><th scope="col" data-i18n="trigger"></th><th scope="col" data-i18n="next"></th><th scope="col" data-i18n="runs"></th><th scope="col" data-i18n="expires"></th><th scope="col" data-i18n="state"></th><th scope="col" data-i18n="actions"></th></tr></thead>
+      <tbody id="schedules"></tbody></table>
+  </section>
+
+  <section aria-labelledby="form-title" id="editor" hidden>
+    <h2 id="form-title"></h2>
+    <form id="form" class="stack">
+      <div class="grid">
+        <label>ID<input name="id" required pattern="[a-zA-Z0-9][a-zA-Z0-9_\\-]{0,63}"></label>
+        <label><span data-i18n="receiverTerminal"></span><select name="receiver" required></select></label>
+      </div>
+      <div class="actions"><button class="button" type="button" id="load-terminals" data-i18n="reloadTerminals"></button><button class="button" type="button" id="read-screen" data-i18n="showScreen"></button></div>
+      <pre id="screen" hidden></pre>
+      <label><span data-i18n="delivery"></span><select name="mode" aria-describedby="mode-help"><option value="prompt" data-i18n="modePrompt"></option><option value="goal" data-i18n="modeGoal"></option></select></label>
+      <p id="mode-help" class="muted" data-i18n="modeHelp"></p>
+      <label><span data-i18n="prompt"></span><textarea name="prompt" required maxlength="16000" aria-describedby="prompt-help"></textarea></label>
+      <p id="prompt-help" class="muted" data-i18n="promptHelp"></p>
+      <div class="grid">
+        <label><span data-i18n="trigger"></span><select name="triggerType"><option value="everyMs" data-i18n="interval"></option><option value="cron">Cron</option><option value="at" data-i18n="once"></option></select></label>
+        <label data-trigger="everyMs"><span data-i18n="intervalMinutes"></span><input name="everyMinutes" type="number" min="0.0167" step="any" value="5"></label>
+        <label data-trigger="cron"><span data-i18n="cronExpression"></span><input name="cron" value="*/5 * * * *"></label>
+        <label data-trigger="cron"><span data-i18n="timezone"></span><input name="timezone"></label>
+        <label data-trigger="at"><span data-i18n="runAt"></span><input name="at" type="datetime-local"></label>
+      </div>
+      <div class="grid">
+        <label><span data-i18n="maxRuns"></span><input name="maxRuns" type="number" min="1" max="100000" required value="12"></label>
+        <label><span data-i18n="expires"></span><input name="expiresAt" type="datetime-local" required></label>
+        <label><span data-i18n="timeoutSeconds"></span><input name="timeoutSeconds" type="number" min="0.1" max="900" step="any" required value="30"></label>
+        <label><span data-i18n="cooldownMinutes"></span><input name="cooldownMinutes" type="number" min="0" max="1440" step="any" value="0"></label>
+        <label style="display: flex; align-items: center; gap: var(--space-2); align-self: end"><input name="enabled" type="checkbox" checked><span data-i18n="enabled"></span></label>
+      </div>
+      <div class="actions"><button class="button" data-variant="primary" type="submit" data-i18n="save"></button><button class="button" type="button" id="cancel" data-i18n="cancel"></button></div>
+    </form>
+  </section>
+
+  <section aria-labelledby="history-title">
+    <h2 id="history-title" data-i18n="recentRuns"></h2>
+    <table><thead><tr><th scope="col" data-i18n="started"></th><th scope="col" data-i18n="schedule"></th><th scope="col" data-i18n="status"></th><th scope="col" data-i18n="deliveredPrompt"></th><th scope="col" data-i18n="detail"></th></tr></thead><tbody id="history"></tbody></table>
+  </section>
+</main>
+<script>
+const messages = {
+  en: {
+    language: 'Language', theme: 'Theme', themeSystem: 'System', themeLight: 'Light', themeDark: 'Dark',
+    schedules: 'Schedules', refresh: 'Refresh', newSchedule: 'New schedule', receiver: 'Receiver', prompt: 'Prompt', trigger: 'Trigger', next: 'Next', runs: 'Runs', expires: 'Expires', state: 'State', actions: 'Actions',
+    receiverTerminal: 'Receiver terminal', reloadTerminals: 'Reload terminals', showScreen: 'Show recent screen', delivery: 'Delivery',
+    modePrompt: 'Prompt \u2014 one turn', modeGoal: 'Goal \u2014 sent as /goal, works until the condition holds',
+    modeHelp: 'Use Goal when the receiver should keep working across turns until a verifiable condition is met; it replaces any goal already set in that session. Use Prompt for a single check or instruction.',
+    promptHelp: 'Write what the receiving session should do, in words a person can review: the goal, what to check, the completion criteria, and what to do when blocked. The exact text is stored and delivered as written; newlines become spaces.',
+    interval: 'Interval', once: 'Once', intervalMinutes: 'Interval (minutes)', cronExpression: 'Cron expression', timezone: 'Timezone', runAt: 'Run at',
+    maxRuns: 'Max runs', timeoutSeconds: 'Timeout (seconds)', cooldownMinutes: 'Cooldown (minutes)', enabled: 'Enabled', save: 'Save', cancel: 'Cancel',
+    recentRuns: 'Recent runs', started: 'Started', schedule: 'Schedule', status: 'Status', deliveredPrompt: 'Delivered prompt', detail: 'Detail',
+    editTitle: id => \`Edit \${id}\`, edit: 'Edit', pause: 'Pause', resume: 'Resume', delete: 'Delete', confirmDelete: id => \`Delete schedule \${id}? Run receipts are kept.\`,
+    pending: 'pending', enabledBadge: 'enabled', paused: 'paused', noSchedules: 'No schedules.', commandTarget: 'Command target \u2014 edit with the CLI',
+    daemonRunning: pid => \`Daemon running (pid \${pid})\`, daemonStopped: 'Daemon not running \u2014 schedules fire only after \`start\`',
+    loading: 'Loading\u2026', selectTerminal: 'Select a terminal', noAgent: '[no running agent]', notListed: 'not currently listed', selectFirst: 'Select a terminal first',
+    once_: when => \`once \${when}\`, every: min => \`every \${min} min\`, cron: (e, tz) => \`cron \${e} (\${tz})\`,
+    noToken: 'Open the URL printed by \`agent-scheduler ui\`; it carries the access token.', screenLabel: 'Recent terminal screen',
+  },
+  ko: {
+    language: '\uC5B8\uC5B4', theme: '\uD14C\uB9C8', themeSystem: '\uC2DC\uC2A4\uD15C', themeLight: '\uB77C\uC774\uD2B8', themeDark: '\uB2E4\uD06C',
+    schedules: '\uC2A4\uCF00\uC904', refresh: '\uC0C8\uB85C\uACE0\uCE68', newSchedule: '\uC0C8 \uC2A4\uCF00\uC904', receiver: '\uC218\uC2E0 \uB300\uC0C1', prompt: '\uD504\uB86C\uD504\uD2B8', trigger: '\uC2E4\uD589 \uC870\uAC74', next: '\uB2E4\uC74C \uC2E4\uD589', runs: '\uC2E4\uD589 \uD69F\uC218', expires: '\uB9CC\uB8CC', state: '\uC0C1\uD0DC', actions: '\uC791\uC5C5',
+    receiverTerminal: '\uC218\uC2E0 \uD130\uBBF8\uB110', reloadTerminals: '\uD130\uBBF8\uB110 \uB2E4\uC2DC \uBD88\uB7EC\uC624\uAE30', showScreen: '\uCD5C\uADFC \uD654\uBA74 \uBCF4\uAE30', delivery: '\uC804\uB2EC \uBC29\uC2DD',
+    modePrompt: '\uD504\uB86C\uD504\uD2B8 \u2014 \uD55C \uD134', modeGoal: '\uBAA9\uD45C \u2014 /goal \uB85C \uBCF4\uB0B4\uACE0 \uC870\uAC74\uC744 \uB9CC\uC871\uD560 \uB54C\uAE4C\uC9C0 \uC9C4\uD589',
+    modeHelp: '\uC218\uC2E0 \uC138\uC158\uC774 \uD655\uC778 \uAC00\uB2A5\uD55C \uC870\uAC74\uC744 \uB9CC\uC871\uD560 \uB54C\uAE4C\uC9C0 \uC5EC\uB7EC \uD134\uC5D0 \uAC78\uCCD0 \uACC4\uC18D \uC791\uC5C5\uD574\uC57C \uD558\uBA74 \uBAA9\uD45C\uB97C \uACE0\uB985\uB2C8\uB2E4. \uADF8 \uC138\uC158\uC5D0 \uC774\uBBF8 \uC124\uC815\uB41C \uBAA9\uD45C\uB294 \uB300\uCCB4\uB429\uB2C8\uB2E4. \uD55C \uBC88\uC758 \uD655\uC778\uC774\uB098 \uC9C0\uC2DC\uB294 \uD504\uB86C\uD504\uD2B8\uB97C \uACE0\uB985\uB2C8\uB2E4.',
+    promptHelp: '\uC218\uC2E0 \uC138\uC158\uC774 \uD560 \uC77C\uC744 \uC0AC\uB78C\uC774 \uAC80\uD1A0\uD560 \uC218 \uC788\uB294 \uBB38\uC7A5\uC73C\uB85C \uC501\uB2C8\uB2E4: \uBAA9\uC801, \uD655\uC778\uD560 \uB300\uC0C1, \uC644\uB8CC \uAE30\uC900, \uB9C9\uD614\uC744 \uB54C \uD560 \uC77C. \uC785\uB825\uD55C \uBB38\uC7A5\uC774 \uADF8\uB300\uB85C \uC800\uC7A5\uB418\uACE0 \uC804\uB2EC\uB418\uBA70, \uC904\uBC14\uAFC8\uC740 \uACF5\uBC31\uC774 \uB429\uB2C8\uB2E4.',
+    interval: '\uBC18\uBCF5 \uAC04\uACA9', once: '\uD55C \uBC88', intervalMinutes: '\uAC04\uACA9(\uBD84)', cronExpression: 'Cron \uC2DD', timezone: '\uC2DC\uAC04\uB300', runAt: '\uC2E4\uD589 \uC2DC\uAC01',
+    maxRuns: '\uCD5C\uB300 \uC2E4\uD589 \uD69F\uC218', timeoutSeconds: '\uC81C\uD55C \uC2DC\uAC04(\uCD08)', cooldownMinutes: '\uCD5C\uC18C \uAC04\uACA9(\uBD84)', enabled: '\uC0AC\uC6A9', save: '\uC800\uC7A5', cancel: '\uCDE8\uC18C',
+    recentRuns: '\uCD5C\uADFC \uC2E4\uD589 \uAE30\uB85D', started: '\uC2DC\uC791', schedule: '\uC2A4\uCF00\uC904', status: '\uACB0\uACFC', deliveredPrompt: '\uC804\uB2EC\uB41C \uD504\uB86C\uD504\uD2B8', detail: '\uC0C1\uC138',
+    editTitle: id => \`\${id} \uC218\uC815\`, edit: '\uC218\uC815', pause: '\uC77C\uC2DC\uC815\uC9C0', resume: '\uC7AC\uAC1C', delete: '\uC0AD\uC81C', confirmDelete: id => \`\${id} \uC2A4\uCF00\uC904\uC744 \uC0AD\uC81C\uD560\uAE4C\uC694? \uC2E4\uD589 \uAE30\uB85D\uC740 \uB0A8\uC2B5\uB2C8\uB2E4.\`,
+    pending: '\uD655\uC778 \uD544\uC694', enabledBadge: '\uC0AC\uC6A9 \uC911', paused: '\uC77C\uC2DC\uC815\uC9C0', noSchedules: '\uC2A4\uCF00\uC904\uC774 \uC5C6\uC2B5\uB2C8\uB2E4.', commandTarget: '\uBA85\uB839 \uB300\uC0C1 \u2014 CLI \uB85C \uC218\uC815',
+    daemonRunning: pid => \`\uB370\uBAAC \uC2E4\uD589 \uC911 (pid \${pid})\`, daemonStopped: '\uB370\uBAAC\uC774 \uAEBC\uC838 \uC788\uC2B5\uB2C8\uB2E4 \u2014 \`start\` \uD6C4\uC5D0 \uC2E4\uD589\uB429\uB2C8\uB2E4',
+    loading: '\uBD88\uB7EC\uC624\uB294 \uC911\u2026', selectTerminal: '\uD130\uBBF8\uB110\uC744 \uC120\uD0DD\uD558\uC138\uC694', noAgent: '[\uC2E4\uD589 \uC911\uC778 \uC5D0\uC774\uC804\uD2B8 \uC5C6\uC74C]', notListed: '\uD604\uC7AC \uBAA9\uB85D\uC5D0 \uC5C6\uC74C', selectFirst: '\uBA3C\uC800 \uD130\uBBF8\uB110\uC744 \uC120\uD0DD\uD558\uC138\uC694',
+    once_: when => \`\uD55C \uBC88 \${when}\`, every: min => \`\${min}\uBD84\uB9C8\uB2E4\`, cron: (e, tz) => \`cron \${e} (\${tz})\`,
+    noToken: '\`agent-scheduler ui\` \uAC00 \uCD9C\uB825\uD55C \uC8FC\uC18C\uB85C \uC5EC\uC138\uC694. \uADF8 \uC8FC\uC18C\uC5D0 \uC811\uADFC \uD1A0\uD070\uC774 \uB4E4\uC5B4 \uC788\uC2B5\uB2C8\uB2E4.', screenLabel: '\uCD5C\uADFC \uD130\uBBF8\uB110 \uD654\uBA74',
+  },
+};
+const token = new URLSearchParams(location.hash.slice(1)).get('token');
+const $ = id => document.getElementById(id);
+const form = $('form');
+let schedules = [], editing = null, lastError = null, receivers = new Map();
+let lang = localStorage.getItem('lang') ?? (navigator.language?.startsWith('ko') ? 'ko' : 'en');
+const t = (key, ...args) => { const value = messages[lang][key]; return typeof value === 'function' ? value(...args) : value; };
+
+const dark = matchMedia('(prefers-color-scheme: dark)');
+function applyTheme() {
+  const choice = localStorage.getItem('theme') ?? 'system';
+  $('theme').value = choice;
+  document.documentElement.dataset.theme = choice === 'system' ? (dark.matches ? 'dark' : 'light') : choice;
+}
+function applyLanguage() {
+  document.documentElement.lang = lang; $('lang').value = lang;
+  for (const el of document.querySelectorAll('[data-i18n]')) el.textContent = t(el.dataset.i18n);
+  $('screen').setAttribute('aria-label', t('screenLabel'));
+  $('form-title').textContent = editing ? t('editTitle', editing) : t('newSchedule');
+  if (lastError) $('error').textContent = lastError.key ? t(lastError.key) : lastError.message;
+}
+$('theme').addEventListener('change', e => { localStorage.setItem('theme', e.target.value); applyTheme(); });
+dark.addEventListener('change', applyTheme);
+$('lang').addEventListener('change', e => { lang = e.target.value; localStorage.setItem('lang', lang); applyLanguage(); refresh(); if (!$('editor').hidden) loadTerminals(form.receiver.value && JSON.parse(form.receiver.value)); });
+
+async function api(method, path, value) {
+  const res = await fetch(path, { method, headers: { authorization: \`Bearer \${token}\`, 'content-type': 'application/json' }, body: value === undefined ? undefined : JSON.stringify(value) });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error ?? res.statusText);
+  return data;
+}
+// Server errors are shown verbatim; page messages follow the selected language.
+const fail = error => { lastError = error; $('error').textContent = error.key ? t(error.key) : error.message; };
+const clearError = () => { lastError = null; $('error').textContent = ''; };
+const cell = (text, className) => { const td = document.createElement('td'); td.textContent = text ?? '\u2014'; if (className) td.className = className; return td; };
+const when = value => value ? new Date(value).toLocaleString(lang) : '\u2014';
+const local = value => { const d = new Date(value), p = n => String(n).padStart(2, '0'); return \`\${d.getFullYear()}-\${p(d.getMonth() + 1)}-\${p(d.getDate())}T\${p(d.getHours())}:\${p(d.getMinutes())}\`; };
+const badge = (text, tone) => { const s = document.createElement('span'); s.className = 'badge'; s.dataset.tone = tone; s.textContent = text; return s; };
+const describeTarget = x => x.type === 'command' ? \`command \${x.argv.join(' ')}\` : x.type === 'cmux' ? \`cmux \${x.workspace} / \${x.surface}\` : x.type === 'orca' ? \`orca \${x.terminal}\` : \`tmux \${x.socket} \${x.pane}\`;
+const describeTrigger = x => x.at ? t('once_', when(x.at)) : x.everyMs ? t('every', x.everyMs / 60000) : t('cron', x.cron.expression, x.cron.timezone);
+const delivered = target => target?.prompt ? \`\${target.mode === 'goal' ? '/goal ' : ''}\${target.prompt}\` : '\u2014';
+const button = (label, variant, onClick, disabled) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'button'; b.textContent = label; if (variant) b.dataset.variant = variant; b.disabled = !!disabled; b.addEventListener('click', onClick); return b; };
+
+async function refresh() {
+  clearError();
+  try {
+    const [list, runs, status] = await Promise.all([api('GET', '/api/schedules'), api('GET', '/api/history'), api('GET', '/api/status'), receivers.size ? null : remember(api('GET', '/api/terminals')).catch(() => null)]);
+    schedules = list;
+    $('status').textContent = \`\${status.daemon ? t('daemonRunning', status.daemon.pid) : t('daemonStopped')} \xB7 \${status.store}\`;
+    const body = $('schedules'); body.replaceChildren();
+    for (const { spec, state } of list) {
+      const tr = document.createElement('tr');
+      const s = cell(''); s.replaceChildren(state?.pending ? badge(t('pending'), 'warn') : spec.enabled ? badge(t('enabledBadge'), 'ok') : badge(t('paused'), 'muted'));
+      const actions = document.createElement('td'); actions.className = 'actions';
+      const command = spec.target.type === 'command', id = encodeURIComponent(spec.id);
+      actions.append(
+        button(t('edit'), null, () => openEditor(spec), command || state?.pending),
+        button(spec.enabled ? t('pause') : t('resume'), null, () => act('POST', \`/api/schedules/\${id}/\${spec.enabled ? 'pause' : 'resume'}\`)),
+        button(t('delete'), 'danger', () => confirm(t('confirmDelete', spec.id)) && act('DELETE', \`/api/schedules/\${id}\`), state?.pending));
+      const known = command ? null : receivers.get(receiverKey(spec.target));
+      const target = cell(known ? known.label : describeTarget(spec.target), known ? null : 'mono');
+      if (known) { const sub = document.createElement('div'); sub.className = 'mono muted'; sub.textContent = describeTarget(spec.target); target.append(sub); }
+      tr.append(cell(spec.id, 'mono nowrap'), target, cell(command ? t('commandTarget') : delivered(spec.target), 'prompt'), cell(describeTrigger(spec.trigger)), cell(when(state?.nextAt)), cell(\`\${state?.runs ?? 0} / \${spec.maxRuns}\`), cell(when(spec.expiresAt)), s, actions);
+      body.append(tr);
+    }
+    if (!list.length) { const tr = document.createElement('tr'); const td = cell(t('noSchedules'), 'muted'); td.colSpan = 9; tr.append(td); body.append(tr); }
+    const hist = $('history'); hist.replaceChildren();
+    for (const run of runs.filter(Boolean).sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 50)) {
+      const tr = document.createElement('tr'); const st = cell('');
+      st.replaceChildren(badge(run.status, run.status === 'uncertain' || run.status === 'intent' ? 'danger' : run.status === 'not-delivered' ? 'warn' : 'ok'));
+      tr.append(cell(when(run.startedAt)), cell(run.id, 'mono'), st, cell(delivered(run.definition?.target), 'prompt'), cell(run.error ?? run.acknowledgment, 'muted'));
+      hist.append(tr);
+    }
+  } catch (error) { fail(error); }
+}
+const receiverKey = ({ prompt, mode, ...rest }) => JSON.stringify(rest).toLowerCase();
+async function remember(promise) {
+  const groups = await promise;
+  receivers = new Map(groups.flatMap(g => g.terminals.map(x => [receiverKey(x.target), x])));
+  return groups;
+}
+async function act(method, path) { try { await api(method, path); await refresh(); } catch (error) { fail(error); } }
+
+async function loadTerminals(selected) {
+  const select = form.receiver; select.replaceChildren(new Option(t('loading'), ''));
+  try {
+    const groups = await remember(api('GET', '/api/terminals'));
+    select.replaceChildren(new Option(t('selectTerminal'), ''));
+    for (const g of groups) {
+      const og = document.createElement('optgroup'); og.label = g.available ? g.type : \`\${g.type} \u2014 \${g.error}\`;
+      for (const x of g.terminals) {
+        // A receiver without a running agent would get the prompt typed into a shell.
+        const option = new Option([x.live ? x.agent && \`[\${x.agent}]\` : t('noAgent'), x.label, x.group && \`\xB7 \${x.group}\`, x.cwd && \`\xB7 \${x.cwd}\`].filter(Boolean).join(' '), JSON.stringify(x.target));
+        option.disabled = !x.live; og.append(option);
+      }
+      if (!g.terminals.length) og.disabled = true;
+      select.append(og);
+    }
+    if (selected) {
+      const key = JSON.stringify(selected);
+      if (![...select.options].some(o => o.value === key)) select.append(new Option(\`\${describeTarget(selected)} (\${t('notListed')})\`, key));
+      select.value = key;
+    }
+  } catch (error) { fail(error); }
+}
+function showTrigger() { for (const el of form.querySelectorAll('[data-trigger]')) el.hidden = el.dataset.trigger !== form.triggerType.value; }
+function openEditor(spec) {
+  editing = spec?.id ?? null; form.reset(); $('screen').hidden = true;
+  $('form-title').textContent = editing ? t('editTitle', editing) : t('newSchedule');
+  form.id.readOnly = !!editing;
+  form.timezone.value = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  form.expiresAt.value = local(Date.now() + 7 * 864e5);
+  if (spec) {
+    form.id.value = spec.id; form.prompt.value = spec.target.prompt; form.mode.value = spec.target.mode ?? 'prompt'; form.enabled.checked = spec.enabled;
+    form.maxRuns.value = spec.maxRuns; form.expiresAt.value = local(spec.expiresAt); form.timeoutSeconds.value = spec.timeoutMs / 1000; form.cooldownMinutes.value = (spec.cooldownMs ?? 0) / 60000;
+    const x = spec.trigger; form.triggerType.value = x.at ? 'at' : x.everyMs ? 'everyMs' : 'cron';
+    if (x.at) form.at.value = local(x.at);
+    if (x.everyMs) form.everyMinutes.value = x.everyMs / 60000;
+    if (x.cron) { form.cron.value = x.cron.expression; form.timezone.value = x.cron.timezone; }
+  }
+  showTrigger(); $('editor').hidden = false; loadTerminals(spec?.target && (({ prompt, mode, ...rest }) => rest)(spec.target)); form.id.focus();
+}
+form.triggerType.addEventListener('change', showTrigger);
+$('new').addEventListener('click', () => openEditor());
+$('refresh').addEventListener('click', refresh);
+$('cancel').addEventListener('click', () => { $('editor').hidden = true; editing = null; });
+$('load-terminals').addEventListener('click', () => loadTerminals(form.receiver.value && JSON.parse(form.receiver.value)));
+$('read-screen').addEventListener('click', async () => {
+  if (!form.receiver.value) return fail({ key: 'selectFirst' });
+  try { const { screen } = await api('POST', '/api/terminals/read', { target: JSON.parse(form.receiver.value) }); $('screen').textContent = screen; $('screen').hidden = false; }
+  catch (error) { fail(error); }
+});
+form.addEventListener('submit', async event => {
+  event.preventDefault(); clearError();
+  const f = form, type = f.triggerType.value;
+  const trigger = type === 'at' ? { at: new Date(f.at.value).toISOString() } : type === 'everyMs' ? { everyMs: Math.round(Number(f.everyMinutes.value) * 60000) } : { cron: { expression: f.cron.value.trim(), timezone: f.timezone.value.trim() } };
+  const spec = { schemaVersion: 1, id: f.id.value.trim(), enabled: f.enabled.checked, trigger, target: { ...JSON.parse(f.receiver.value), mode: f.mode.value, prompt: f.prompt.value }, maxRuns: Number(f.maxRuns.value), expiresAt: new Date(f.expiresAt.value).toISOString(), timeoutMs: Math.round(Number(f.timeoutSeconds.value) * 1000) };
+  const cooldown = Math.round(Number(f.cooldownMinutes.value) * 60000); if (cooldown) spec.cooldownMs = cooldown;
+  try {
+    await api(editing ? 'PUT' : 'POST', editing ? \`/api/schedules/\${encodeURIComponent(editing)}\` : '/api/schedules', spec);
+    $('editor').hidden = true; editing = null; await refresh();
+  } catch (error) { fail(error); }
+});
+applyTheme(); applyLanguage();
+if (!token) fail({ key: 'noToken' });
+else refresh();
+</script>
+</body>
+</html>
+` : await readFile2(new URL("./ui.html", import.meta.url), "utf8");
+var limit = 1 << 20;
+var body = (req) => new Promise((resolve2, reject) => {
+  let data = "";
+  req.setEncoding("utf8");
+  req.on("data", (chunk) => {
+    data += chunk;
+    if (data.length > limit) {
+      reject(Object.assign(new Error("Request too large"), { status: 413 }));
+      req.destroy();
+    }
+  });
+  req.on("end", () => {
+    try {
+      resolve2(data ? JSON.parse(data) : {});
+    } catch {
+      reject(Object.assign(new Error("Invalid JSON"), { status: 400 }));
+    }
+  });
+  req.on("error", reject);
+});
+async function history(store2) {
+  const files = (await readdir2(join2(store2.root, "runs"))).filter((n) => n.endsWith(".json")).sort();
+  return Promise.all(files.map((n) => store2.read(join2(store2.root, "runs", n))));
+}
+async function status(store2) {
+  return { store: store2.root, daemon: await store2.read(join2(store2.root, "daemon.lock", "owner.json")), storeLock: await store2.read(join2(store2.root, "store.lock", "owner.json")) };
+}
+var terminalSpec = (spec) => {
+  if (spec?.target?.type === "command") throw Object.assign(new Error("Command targets are registered and edited with the CLI"), { status: 403 });
+  return spec;
+};
+function createUi(store2, { token = randomBytes(24).toString("base64url"), terminals: terminals2 = listTerminals, read = readTerminal } = {}) {
+  const expected = Buffer.from(`Bearer ${token}`);
+  const routes = {
+    "GET /api/schedules": () => store2.list(),
+    "GET /api/history": () => history(store2),
+    "GET /api/status": () => status(store2),
+    "GET /api/terminals": () => terminals2(),
+    // The screen is context for the person writing the prompt; nothing is sent to the terminal.
+    "POST /api/terminals/read": async (req) => ({ screen: await read((await body(req)).target) }),
+    "POST /api/schedules": async (req) => {
+      const spec = terminalSpec(await body(req));
+      if (await store2.read(store2.path("schedules", spec.id))) throw Object.assign(new Error("Schedule id already exists"), { status: 409 });
+      return store2.put(spec);
+    },
+    "PUT /api/schedules/:id": async (req, id) => {
+      const spec = terminalSpec(await body(req));
+      if (spec.id !== id) throw Object.assign(new Error("Schedule id cannot change"), { status: 400 });
+      const current = await store2.read(store2.path("schedules", id));
+      if (!current) throw Object.assign(new Error("Schedule not found"), { status: 404 });
+      terminalSpec(current);
+      return store2.put(spec);
+    },
+    "POST /api/schedules/:id/pause": (req, id) => store2.enable(id, false),
+    "POST /api/schedules/:id/resume": (req, id) => store2.enable(id, true),
+    "DELETE /api/schedules/:id": (req, id) => store2.remove(id)
+  };
+  const server = createServer(async (req, res) => {
+    const send = (code, value, type = "application/json") => {
+      res.writeHead(code, { "content-type": type, "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer", "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'" });
+      res.end(type === "application/json" ? JSON.stringify(value) : value);
+    };
+    try {
+      const { port: port2 } = server.address();
+      if (![`127.0.0.1:${port2}`, `localhost:${port2}`].includes(req.headers.host)) return send(421, { error: "Unexpected host" });
+      const url = new URL(req.url, `http://${req.headers.host}`);
+      if (req.method === "GET" && url.pathname === "/") return send(200, page, "text/html; charset=utf-8");
+      const auth = Buffer.from(req.headers.authorization ?? "");
+      if (auth.length !== expected.length || !timingSafeEqual(auth, expected)) return send(401, { error: "Unauthorized" });
+      const parts = url.pathname.split("/");
+      const id = parts[3] && decodeURIComponent(parts[3]);
+      const route = parts[2] === "schedules" && parts.length > 3 ? ["/api/schedules/:id", ...parts.slice(4)].join("/") : url.pathname;
+      const handler = routes[`${req.method} ${route}`];
+      if (!handler) return send(404, { error: "Not found" });
+      send(200, await handler(req, id));
+    } catch (error) {
+      send(error.status ?? 400, { error: error.message });
+    }
+  });
+  return { server, token };
+}
+
 // src/cli.mjs
 var args = process.argv.slice(2);
-var index = args.indexOf("--store");
-if (index !== -1 && !args[index + 1]) throw new Error("--store requires a path");
-var root = index === -1 ? process.env.AGENT_SCHEDULER_HOME ?? join2(homedir(), ".local", "state", "agent-scheduler") : args.splice(index, 2)[1];
+var option = (name) => {
+  const index = args.indexOf(name);
+  if (index === -1) return void 0;
+  if (!args[index + 1]) throw new Error(`${name} requires a value`);
+  return args.splice(index, 2)[1];
+};
+var root = option("--store") ?? process.env.AGENT_SCHEDULER_HOME ?? join3(homedir(), ".local", "state", "agent-scheduler");
+var port = option("--port");
 var store = new Store(root);
 var [command, ...rest] = args;
 var print = (value) => process.stdout.write(JSON.stringify(value, null, 2) + "\n");
 try {
   await store.init();
   if (!command || command === "help" || command === "--help") {
-    console.log(`agent-scheduler 0.1.0 \u2014 Node >=22
+    console.log(`agent-scheduler 0.2.0 \u2014 Node >=22
 
 Usage: agent-scheduler [--store PATH] COMMAND
 
@@ -1166,15 +1694,18 @@ stop             Request graceful daemon stop
 status           Inspect daemon owner and store
 history          Read run receipts
 unlock NAME      Remove store/daemon lock only after confirmed owner exit
+terminals        List cmux, orca and tmux receivers
+session-end      Remove schedules addressed to this terminal (session end hook)
+ui [--port N]    Serve the local management page on 127.0.0.1
 
-No API key, HTTP server or model process is required.`);
+No API key or model process is required.`);
   } else if (command === "put") {
     if (rest.length !== 1) throw new Error("put requires FILE or -");
     let input;
     if (rest[0] === "-") {
       input = "";
       for await (const chunk of process.stdin) input += chunk;
-    } else input = await readFile2(rest[0], "utf8");
+    } else input = await readFile3(rest[0], "utf8");
     print(await store.put(JSON.parse(input)));
   } else if (command === "list") print(await store.list());
   else if (command === "pause" || command === "resume") print(await store.enable(rest[0], command === "resume"));
@@ -1182,11 +1713,25 @@ No API key, HTTP server or model process is required.`);
   else if (command === "resolve") print(await store.resolveRun(rest[0], rest[1]));
   else if (command === "unlock") print(await store.unlock(rest[0]));
   else if (command === "tick") print(await store.tick());
-  else if (command === "history") {
-    const files = (await readdir2(join2(store.root, "runs"))).filter((n) => n.endsWith(".json")).sort();
-    print(await Promise.all(files.map((n) => store.read(join2(store.root, "runs", n)))));
-  } else if (command === "status") print({ store: store.root, daemon: await store.read(join2(store.root, "daemon.lock", "owner.json")), storeLock: await store.read(join2(store.root, "store.lock", "owner.json")) });
-  else if (command === "serve") {
+  else if (command === "history") print(await history(store));
+  else if (command === "status") print(await status(store));
+  else if (command === "terminals") print(await listTerminals());
+  else if (command === "session-end") {
+    const receivers = await currentReceivers();
+    print({ receivers, schedules: receivers.length ? await store.removeForReceivers(receivers) : [] });
+  } else if (command === "ui") {
+    const { server, token } = createUi(store);
+    await new Promise((resolve2, reject) => {
+      server.once("error", reject);
+      server.listen(Number(port ?? 0), "127.0.0.1", resolve2);
+    });
+    print({ url: `http://127.0.0.1:${server.address().port}/#token=${token}`, store: store.root });
+    await new Promise((resolve2) => {
+      process.once("SIGINT", resolve2);
+      process.once("SIGTERM", resolve2);
+    });
+    await new Promise((resolve2) => server.close(resolve2));
+  } else if (command === "serve") {
     await store.lock("daemon", async () => {
       const controller = new AbortController();
       const active = /* @__PURE__ */ new Set();
@@ -1199,7 +1744,7 @@ No API key, HTTP server or model process is required.`);
       process.once("SIGTERM", stop);
       try {
         while (!stopping) {
-          if (await store.read(join2(store.root, "daemon.lock", "stop.json"))) {
+          if (await store.read(join3(store.root, "daemon.lock", "stop.json"))) {
             stop();
             break;
           }
@@ -1219,23 +1764,23 @@ No API key, HTTP server or model process is required.`);
       }
     });
   } else if (command === "start") {
-    if (await store.read(join2(store.root, "daemon.lock", "owner.json"))) throw new Error("Daemon lock exists; inspect status before starting");
-    const log = await open2(join2(store.root, "daemon.log"), "a", 384);
+    if (await store.read(join3(store.root, "daemon.lock", "owner.json"))) throw new Error("Daemon lock exists; inspect status before starting");
+    const log = await open2(join3(store.root, "daemon.log"), "a", 384);
     try {
       const child = spawn2(process.execPath, [fileURLToPath(import.meta.url), "--store", store.root, "serve"], { detached: true, stdio: ["ignore", log.fd, log.fd] });
       child.unref();
       await new Promise((r) => setTimeout(r, 500));
-      const owner = await store.read(join2(store.root, "daemon.lock", "owner.json"));
+      const owner = await store.read(join3(store.root, "daemon.lock", "owner.json"));
       if (owner?.pid !== child.pid) throw new Error("Daemon did not acquire its lock; inspect daemon.log");
       print({ status: "started", ...owner, store: store.root });
     } finally {
       await log.close();
     }
   } else if (command === "stop") {
-    const path = join2(store.root, "daemon.lock");
-    const owner = await store.read(join2(path, "owner.json"));
+    const path = join3(store.root, "daemon.lock");
+    const owner = await store.read(join3(path, "owner.json"));
     if (!owner) throw new Error("No daemon owner");
-    await store.atomic(join2(path, "stop.json"), { owner });
+    await store.atomic(join3(path, "stop.json"), { owner });
     print({ status: "stop-requested", owner });
   } else throw new Error(`Unknown command: ${command}`);
 } catch (error) {

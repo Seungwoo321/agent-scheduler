@@ -5,7 +5,7 @@ import { tmpdir, hostname } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { Store, validate, nextDue } from '../src/core.mjs';
-import { dispatch, processCommand } from '../src/targets.mjs';
+import { dispatch, processCommand, currentReceivers } from '../src/targets.mjs';
 
 const spec = (id = 'watch') => ({ schemaVersion: 1, id, enabled: true, trigger: { at: '2026-01-01T00:00:00Z' }, target: { type: 'command', argv: [process.execPath, '-e', 'process.exit(0)'], cwd: tmpdir() }, maxRuns: 2, expiresAt: '2099-01-01T00:00:00Z', timeoutMs: 5000 });
 async function fixture(t) {
@@ -139,20 +139,49 @@ test('AC-3 recovery mutex prevents parallel stale-owner unlocks', async t => {
   assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
 });
 
-test('AC-2 terminal targets use literal text and explicit Enter; queue acknowledges delivery only', async () => {
+test('AC-2 terminal targets verify a live agent, then send literal text and Enter', async () => {
   const uuid = '12345678-1234-1234-1234-123456789abc';
-  const calls = [], execute = async (argv, options) => { calls.push({ argv, options }); return { code: 0, output: argv[0] === 'tmux' ? '%3' : uuid }; };
+  const live = JSON.stringify({ sessions: [{ surface_id: uuid, stored_pid_exists: true }] });
+  const calls = [], execute = async (argv, options) => {
+    calls.push({ argv, options });
+    const output = argv[0] === 'tmux' ? '%3\tclaude' : argv[1] === 'sessions' ? live : argv[1] === 'terminal' && argv[2] === 'show' ? '{"ok":true,"result":{"terminal":{"agentIdentity":"codex"}}}' : uuid;
+    return { code: 0, output };
+  };
   assert.equal((await dispatch({ type: 'cmux', surface: uuid, workspace: uuid, prompt: 'first\nsecond\\nend' }, { execute })).status, 'transport-accepted');
-  assert.equal(JSON.parse(calls[1].argv.at(-1)).text, 'first second\\nend'); assert.equal(calls[2].argv.at(-1), 'Enter');
+  assert.equal(JSON.parse(calls[2].argv.at(-1)).text, 'first second\\nend'); assert.equal(calls[3].argv.at(-1), 'Enter');
   calls.length = 0;
   await dispatch({ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'C-c; $(echo x)' }, { execute });
   assert.deepEqual(calls[1].argv.slice(-3), ['-l', '--', 'C-c; $(echo x)']);
   calls.length = 0;
-  const result = await dispatch({ type: 'codex-queue', home: '/tmp/codex-home', thread: uuid, prompt: 'check' }, { execute });
-  assert.equal(calls[0].argv[1], 'queue'); assert.equal(calls[0].options.env.CODEX_HOME, '/tmp/codex-home');
+  const result = await dispatch({ type: 'orca', terminal: 'term_1', mode: 'goal', prompt: 'all tests pass' }, { execute });
+  assert.deepEqual(calls[1].argv, ['orca', 'terminal', 'send', '--terminal', 'term_1', '--text', '/goal all tests pass', '--enter', '--json']);
   assert.equal(result.acknowledgment, 'delivery-only-not-model-turn');
   await assert.rejects(dispatch({ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'bad\x1b[2J' }), /Invalid/);
   await assert.rejects(dispatch({ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'bad\tcompletion' }), /Tab/);
+  await assert.rejects(dispatch({ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', mode: 'loop', prompt: 'x' }), /mode/);
+  await assert.rejects(dispatch({ type: 'codex-queue', home: '/tmp', thread: uuid, prompt: 'x' }), /removed/);
+});
+
+test('AC-2 an ended receiver session is not typed into and its schedule is paused', async t => {
+  const store = await fixture(t);
+  await store.put({ ...spec(), target: { type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' } });
+  const calls = [];
+  const execute = (target, options) => dispatch(target, { ...options, execute: async argv => { calls.push(argv); return { code: 0, output: '%3\tzsh' }; } });
+  const [run] = await store.tick({ execute });
+  assert.equal(run.status, 'not-delivered');
+  assert.equal(calls.length, 1);
+  const [{ spec: saved, state }] = await store.list();
+  assert.equal(saved.enabled, false); assert.equal(state.pending, undefined);
+});
+
+test('AC-3 session end removes schedules addressed to that terminal only', async t => {
+  const store = await fixture(t), uuid = '12345678-1234-1234-1234-123456789abc', other = '12345678-1234-1234-1234-123456789abd';
+  await store.put({ ...spec('mine'), target: { type: 'cmux', workspace: uuid, surface: uuid, prompt: 'check' } });
+  await store.put({ ...spec('theirs'), target: { type: 'cmux', workspace: uuid, surface: other, prompt: 'check' } });
+  await store.put(spec('command'));
+  const receivers = await currentReceivers({ CMUX_WORKSPACE_ID: uuid.toUpperCase(), CMUX_SURFACE_ID: uuid.toUpperCase() });
+  assert.deepEqual(await store.removeForReceivers(receivers), [{ id: 'mine', removed: true }]);
+  assert.deepEqual((await store.list()).map(e => e.spec.id), ['command', 'theirs']);
 });
 
 test('AC-2 partial terminal submission failure does not try another transport', async () => {
