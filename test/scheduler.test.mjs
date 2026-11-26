@@ -139,26 +139,36 @@ test('AC-3 recovery mutex prevents parallel stale-owner unlocks', async t => {
   assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
 });
 
-// A terminal model: an agent input line with a prompt glyph, a cursor after typed text, and Enter
-// that submits (clears the line) unless the agent leaves pasted text in place.
-function fakeTerminal({ draft = '', lifecycle = 'idle', enterSubmits = true, pid = 4242, start = 'Thu Nov 26 10:00:00 2026' } = {}) {
+// A terminal model: an agent input line with a prompt glyph, typed text left of the cursor, an optional
+// draft right of the cursor, a faint ghost suggestion, a working indicator, and Enter that submits
+// (clears the line) unless the agent leaves pasted text in place.
+function fakeTerminal({ draft = '', after = '', busy = false, enterSubmits = true, copyMode = false, orcaStages = ['input_accepted', 'turn_started'], pid = 4242, start = 'Thu Nov 26 10:00:00 2026' } = {}) {
   const uuid = '12345678-1234-1234-1234-123456789abc';
-  const term = { draft, lifecycle, enterSubmits, pid, start, typed: [], calls: [] };
+  const term = { draft, after, busy, enterSubmits, pid, start, typed: [], calls: [] };
+  const width = text => [...text].reduce((n, ch) => n + (ch.codePointAt(0) >= 0x1100 ? 2 : 1), 0);
   term.execute = async argv => {
     term.calls.push(argv);
     const [bin, a1, a2] = argv;
     const ok = output => ({ code: 0, output });
+    const status = term.busy ? '✻ Working… (esc to interrupt)' : '';
     if (bin === 'ps') return ok(`${term.pid} ${term.start}\n`);
-    if (bin === 'cmux' && a1 === 'sessions') return ok(JSON.stringify({ sessions: [{ surface_id: uuid, session_id: 's', pid: term.pid, stored_pid_exists: true, agent_lifecycle: term.lifecycle }] }));
-    if (bin === 'cmux' && a1 === 'rpc' && a2 === 'terminal.replay') return ok(JSON.stringify({ render_grid: { cursor: { row: 3, column: 2 + [...term.draft].length }, row_spans: [{ row: 3, column: 0, text: '❯ ' }, { row: 3, column: 2, text: term.draft }, { row: 3, column: 2 + [...term.draft].length + 1, text: 'ghost suggestion' }] } }));
+    if (bin === 'cmux' && a1 === 'sessions') return ok(JSON.stringify({ sessions: [{ surface_id: uuid, session_id: 's', pid: term.pid, stored_pid_exists: true, agent_lifecycle: 'running' }] }));
+    if (bin === 'cmux' && a1 === 'rpc' && a2 === 'terminal.replay') {
+      const col = 2 + width(term.draft);
+      return ok(JSON.stringify({ render_grid: { cursor: { row: 3, column: col }, styles: [{ id: 0, faint: false }, { id: 9, faint: true }], row_spans: [
+        { row: 1, column: 0, text: status, style_id: 0 },
+        { row: 3, column: 0, text: '❯\u00a0', style_id: 0 }, { row: 3, column: 2, text: term.draft, style_id: 0 },
+        { row: 3, column: col, text: term.after, style_id: 0 }, { row: 3, column: col + width(term.after) + 1, text: 'ghost suggestion', style_id: 9 },
+      ] } }));
+    }
     if (bin === 'cmux' && a1 === 'rpc' && a2 === 'surface.send_text') { const text = JSON.parse(argv[3]).text; term.typed.push(text); term.draft += text; return ok('{}'); }
-    if ((bin === 'cmux' && a1 === 'send-key') || (bin === 'tmux' && argv.at(-1) === 'Enter' && !argv.includes('-l'))) { if (term.enterSubmits) term.draft = ''; return ok(''); }
-    if (bin === 'tmux' && argv.includes('display-message')) return ok(argv.at(-1).includes('cursor_x') ? `${2 + term.draft.length}\t5` : '%3\tclaude');
-    if (bin === 'tmux' && argv.includes('capture-pane')) return ok(`❯ ${term.draft}\n`);
+    if ((bin === 'cmux' && a1 === 'send-key') || (bin === 'tmux' && argv.at(-1) === 'Enter' && !argv.includes('-l'))) { if (term.enterSubmits) { term.draft = ''; term.after = ''; } return ok(''); }
+    if (bin === 'tmux' && argv.includes('display-message')) return ok(argv.at(-1).includes('cursor_x') ? `${2 + width(term.draft)}\t2\t${copyMode ? 1 : 0}` : '%3\tclaude');
+    if (bin === 'tmux' && argv.includes('capture-pane')) return ok(`${status}\n\n❯ ${term.draft}${term.after} \x1b[2mghost suggestion\x1b[0m\n`);
     if (bin === 'tmux' && argv.includes('-l')) { term.typed.push(argv.at(-1)); term.draft += argv.at(-1); return ok(''); }
     if (bin === 'orca' && a2 === 'show') return ok('{"ok":true,"result":{"terminal":{"agentIdentity":"codex"}}}');
-    if (bin === 'orca' && a2 === 'wait') return term.lifecycle === 'idle' ? ok('{"ok":true}') : { code: 1, output: '{"ok":false,"error":{"message":"timeout"}}' };
-    if (bin === 'orca' && a2 === 'send') { term.typed.push(argv[argv.indexOf('--text') + 1]); return ok('{"ok":true,"result":{"stages":["input_accepted","turn_started"]}}'); }
+    if (bin === 'orca' && a2 === 'wait') return term.busy ? { code: 1, output: '{"ok":false,"error":{"message":"timeout"}}' } : ok('{"ok":true}');
+    if (bin === 'orca' && a2 === 'send') { term.typed.push(argv[argv.indexOf('--text') + 1]); return ok(JSON.stringify({ ok: true, result: { request: 'r1', stages: orcaStages } })); }
     return ok(uuid);
   };
   return term;
@@ -187,22 +197,34 @@ test('AC-2 a draft or a busy agent is never typed over; the occurrence is skippe
   const uuid = '12345678-1234-1234-1234-123456789abc';
   for (const [target, state] of [
     [{ type: 'cmux', surface: uuid, workspace: uuid, prompt: 'check' }, { draft: '다음 https://example.test' }],
-    [{ type: 'cmux', surface: uuid, workspace: uuid, prompt: 'check' }, { lifecycle: 'running' }],
+    [{ type: 'cmux', surface: uuid, workspace: uuid, prompt: 'check' }, { busy: true }],
+    [{ type: 'cmux', surface: uuid, workspace: uuid, prompt: 'check' }, { after: '커서 뒤 초안' }],
     [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { draft: '쓰던 글' }],
-    [{ type: 'orca', terminal: 'term_1', prompt: 'check' }, { lifecycle: 'running' }],
+    [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { after: 'draft after cursor' }],
+    [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { busy: true }],
+    [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { copyMode: true }],
+    [{ type: 'orca', terminal: 'term_1', prompt: 'check' }, { busy: true }],
   ]) {
     const term = fakeTerminal(state);
     const result = await dispatch(target, { execute: term.execute });
     assert.equal(result.status, 'not-delivered', JSON.stringify(state)); assert.equal(result.receiverGone, false);
     assert.deepEqual(term.typed, []);
-    if (state.draft) assert.equal(term.draft, state.draft, 'the draft is untouched');
+    if (state.draft || state.after) assert.equal(term.draft + term.after, (state.draft ?? '') + (state.after ?? ''), 'the draft is untouched');
   }
-  const store = await fixture(t), term = fakeTerminal({ lifecycle: 'running' });
+  const store = await fixture(t), term = fakeTerminal({ busy: true });
   await store.put({ ...spec(), trigger: { everyMs: 1000 }, target: { type: 'cmux', surface: uuid, workspace: uuid, prompt: 'check' } });
   const [run] = await store.tick({ now: Date.now() + 2000, execute: (target, options) => dispatch(target, { ...options, execute: term.execute }) });
   assert.equal(run.status, 'not-delivered');
   const [{ spec: saved, state }] = await store.list();
   assert.equal(saved.enabled, true); assert.equal(state.pending, undefined);
+});
+
+test('AC-2 a stale running lifecycle record does not block an idle receiver; Orca input acceptance alone is not submission', async () => {
+  const uuid = '12345678-1234-1234-1234-123456789abc';
+  assert.equal((await dispatch({ type: 'cmux', surface: uuid, workspace: uuid, prompt: 'check' }, { execute: fakeTerminal().execute })).status, 'transport-accepted');
+  const accepted = fakeTerminal({ orcaStages: ['input_accepted'] });
+  const result = await dispatch({ type: 'orca', terminal: 'term_1', prompt: 'check' }, { execute: accepted.execute });
+  assert.equal(result.status, 'uncertain'); assert.deepEqual(accepted.typed, ['check']);
 });
 
 test('AC-3 an Enter that does not clear the input line is uncertain, stays pending and is never resent', async t => {
