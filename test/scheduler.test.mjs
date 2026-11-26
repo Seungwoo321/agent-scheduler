@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile, mkdir, symlink, readFile } from 'node:fs/promis
 import { tmpdir, hostname } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
-import { Store, validate, nextDue } from '../src/core.mjs';
+import { Store, validate, nextDue, daemonEnvironment } from '../src/core.mjs';
 import { dispatch, processCommand, currentReceivers } from '../src/targets.mjs';
 
 const spec = (id = 'watch') => ({ schemaVersion: 1, id, enabled: true, trigger: { at: '2026-01-01T00:00:00Z' }, target: { type: 'command', argv: [process.execPath, '-e', 'process.exit(0)'], cwd: tmpdir() }, maxRuns: 2, expiresAt: '2099-01-01T00:00:00Z', timeoutMs: 5000 });
@@ -237,7 +237,7 @@ test('AC-3 session end removes schedules addressed to that terminal only', async
 test('AC-3 session-end hook keeps schedules on /clear and /resume', async t => {
   const store = await fixture(t), uuid = '12345678-1234-1234-1234-123456789abc';
   await store.put({ ...spec('mine'), target: { type: 'cmux', workspace: uuid, surface: uuid, prompt: 'check' } });
-  const run = reason => spawnSync(process.execPath, [new URL('../src/cli.mjs', import.meta.url).pathname, '--store', store.root, 'session-end'], { input: JSON.stringify({ session_id: 's', reason }), encoding: 'utf8', env: { ...process.env, CMUX_WORKSPACE_ID: uuid, CMUX_SURFACE_ID: uuid, TMUX: '', TMUX_PANE: '', ORCA_PANE_KEY: '' } });
+  const run = reason => spawnSync(process.execPath, [new URL('../src/cli.mjs', import.meta.url).pathname, 'session-end'], { input: JSON.stringify({ session_id: 's', reason }), encoding: 'utf8', env: { ...process.env, AGENT_SCHEDULER_HOME: store.root, CMUX_WORKSPACE_ID: uuid, CMUX_SURFACE_ID: uuid, TMUX: '', TMUX_PANE: '', ORCA_PANE_KEY: '' } });
   for (const reason of ['clear', 'resume']) assert.equal(JSON.parse(run(reason).stdout).skipped, reason);
   assert.equal((await store.list()).length, 1);
   assert.deepEqual(JSON.parse(run('prompt_input_exit').stdout).schedules, [{ id: 'mine', removed: true }]);
@@ -247,4 +247,61 @@ test('AC-2 partial terminal submission failure does not try another transport', 
   let calls = 0;
   await assert.rejects(dispatch({ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'hello' }, { execute: async () => ({ code: ++calls === 3 ? 1 : 0, output: '%3' }) }), /Transport failed/);
   assert.equal(calls, 3);
+});
+
+test('AC-6 registering starts the one detached daemon, which also serves the management page', async t => {
+  const store = await fixture(t), cli = new URL('../src/cli.mjs', import.meta.url).pathname;
+  const env = { ...process.env, AGENT_SCHEDULER_HOME: store.root, AGENT_SCHEDULER_PORT: String(40000 + Math.floor(Math.random() * 20000)) };
+  const run = (args, input) => spawnSync(process.execPath, [cli, ...args], { input, encoding: 'utf8', env });
+  // Wait for the daemon process itself to exit before the fixture removes its store.
+  const exited = async pid => { for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { return true; } await new Promise(r => setTimeout(r, 100)); } return false; };
+  let daemonPid;
+  // Signal the daemon directly: a CLI call after the fixture removed the store would recreate it.
+  t.after(async () => { if (!daemonPid) return; try { process.kill(daemonPid, 'SIGTERM'); } catch {} if (!await exited(daemonPid)) process.kill(daemonPid, 'SIGKILL'); });
+  assert.equal(run(['put', '-'], JSON.stringify({ ...spec(), id: 'bad', maxRuns: 0 })).status, 1);
+  assert.equal(await store.daemon(), null, 'an invalid definition does not start the daemon');
+  const first = JSON.parse(run(['put', '-'], JSON.stringify({ ...spec(), enabled: false })).stdout);
+  assert.equal(first.daemon.status, 'started');
+  daemonPid = first.daemon.pid;
+  const second = JSON.parse(run(['put', '-'], JSON.stringify({ ...spec('other'), enabled: false })).stdout);
+  assert.equal(second.daemon.status, 'running'); assert.equal(second.daemon.pid, first.daemon.pid);
+  const url = JSON.parse(run(['ui']).stdout).url;
+  assert.equal(JSON.parse(run(['ui']).stdout).url, url, 'the page URL and token are stable');
+  assert.equal((await fetch(url.split('#')[0])).status, 200);
+  const status = await fetch(url.split('#')[0] + 'api/status', { headers: { authorization: `Bearer ${new URL(url).hash.slice(7)}` } }).then(r => r.json());
+  assert.equal(status.daemon.pid, first.daemon.pid);
+  assert.equal(JSON.parse(run(['status']).stdout).page.listening, true);
+  run(['stop']);
+  assert.equal(await exited(daemonPid), true);
+  assert.equal(await store.daemon(), null);
+});
+
+test('AC-6 concurrent first registrations share one daemon and all persist', async t => {
+  const store = await fixture(t), cli = new URL('../src/cli.mjs', import.meta.url).pathname;
+  const env = { ...process.env, AGENT_SCHEDULER_HOME: store.root, AGENT_SCHEDULER_PORT: String(40000 + Math.floor(Math.random() * 20000)) };
+  const { spawn } = await import('node:child_process');
+  const put = id => new Promise(resolve => {
+    const child = spawn(process.execPath, [cli, 'put', '-'], { env });
+    let out = ''; child.stdout.on('data', d => { out += d; });
+    child.on('close', code => resolve({ code, out }));
+    child.stdin.end(JSON.stringify({ ...spec(id), enabled: false }));
+  });
+  const results = await Promise.all(['r1', 'r2', 'r3', 'r4'].map(put));
+  const pids = new Set(results.map(r => { try { return JSON.parse(r.out).daemon.pid; } catch { return null; } }).filter(Boolean));
+  try {
+    assert.deepEqual(results.map(r => r.code), [0, 0, 0, 0]);
+    assert.equal(pids.size, 1);
+    assert.deepEqual((await store.list()).map(e => e.spec.id), ['r1', 'r2', 'r3', 'r4']);
+  } finally {
+    // Stop before the fixture removes the store; a removed store would hide the stop request.
+    spawnSync(process.execPath, [cli, 'stop'], { env });
+    for (const pid of pids) for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); } catch { break; } await new Promise(r => setTimeout(r, 100)); }
+    // Starters that lost the lock race exit on their own; let them finish before the store is removed.
+    await new Promise(r => setTimeout(r, 2000));
+  }
+});
+
+test('AC-6 the daemon environment drops the starting session identity and provider home', () => {
+  const env = daemonEnvironment({ HOME: '/h', OPENAI_API_KEY: 'k', CMUX_SURFACE_ID: 's', TMUX: 't', TMUX_PANE: '%1', ORCA_PANE_KEY: 'o', CLAUDECODE: '1', CLAUDE_CONFIG_DIR: '/c', CODEX_HOME: '/x', PATH: '/tmp/cmux-cli-shims/ABC:/usr/bin' });
+  assert.deepEqual(env, { HOME: '/h', OPENAI_API_KEY: 'k', PATH: '/usr/bin' });
 });

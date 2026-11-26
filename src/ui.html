@@ -26,7 +26,7 @@
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 var(--font); }
-  main { max-width: 1200px; margin: 0 auto; padding: var(--space-6) var(--space-4); }
+  main { width: 100%; padding: var(--space-6) var(--space-6); }
   h1 { font-size: 20px; margin: 0; } h2 { font-size: 16px; margin: 0 0 var(--space-3); }
   header { display: flex; gap: var(--space-4); align-items: center; flex-wrap: wrap; margin-bottom: var(--space-6); }
   header .prefs { margin-left: auto; display: flex; gap: var(--space-3); }
@@ -50,7 +50,10 @@
   .grid { display: grid; gap: var(--space-4); grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
   .stack { display: grid; gap: var(--space-4); }
   pre { margin: 0; padding: var(--space-3); background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); max-height: 320px; overflow: auto; font: 12px/1.4 var(--mono); white-space: pre-wrap; }
-  .prompt { white-space: pre-wrap; max-width: 420px; }
+  .prompt { white-space: pre-wrap; min-width: 320px; }
+  [role="tablist"] { display: flex; gap: var(--space-1); border-bottom: 1px solid var(--border); margin-bottom: var(--space-4); }
+  [role="tab"] { min-height: 40px; padding: 0 var(--space-4); border: 0; border-bottom: 2px solid transparent; background: none; color: var(--muted); font: inherit; font-weight: 600; cursor: pointer; }
+  [role="tab"][aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
   [role="alert"] { color: var(--danger); min-height: 1.5em; margin: 0 0 var(--space-3); }
 </style>
 </head>
@@ -65,6 +68,11 @@
   </header>
   <p role="alert" id="error"></p>
 
+  <div role="tablist" id="tabs">
+    <button role="tab" type="button" id="tab-schedules" aria-controls="panel-schedules" aria-selected="true" data-i18n="schedules"></button>
+    <button role="tab" type="button" id="tab-runs" aria-controls="panel-runs" aria-selected="false" tabindex="-1" data-i18n="runHistory"></button>
+  </div>
+  <div role="tabpanel" id="panel-schedules" aria-labelledby="tab-schedules">
   <section aria-labelledby="schedules-title">
     <div class="actions" style="justify-content: space-between"><h2 id="schedules-title" data-i18n="schedules"></h2>
       <div class="actions"><button class="button" type="button" id="refresh" data-i18n="refresh"></button><button class="button" data-variant="primary" type="button" id="new" data-i18n="newSchedule"></button></div></div>
@@ -103,10 +111,13 @@
     </form>
   </section>
 
+  </div>
+  <div role="tabpanel" id="panel-runs" aria-labelledby="tab-runs" hidden>
   <section aria-labelledby="history-title">
     <h2 id="history-title" data-i18n="recentRuns"></h2>
     <table><thead><tr><th scope="col" data-i18n="started"></th><th scope="col" data-i18n="schedule"></th><th scope="col" data-i18n="status"></th><th scope="col" data-i18n="deliveredPrompt"></th><th scope="col" data-i18n="detail"></th></tr></thead><tbody id="history"></tbody></table>
   </section>
+  </div>
 </main>
 <script>
 const messages = {
@@ -119,10 +130,10 @@ const messages = {
     promptHelp: 'Write what the receiving session should do, in words a person can review: the goal, what to check, the completion criteria, and what to do when blocked. The exact text is stored and delivered as written; newlines become spaces.',
     interval: 'Interval', once: 'Once', intervalMinutes: 'Interval (minutes)', cronExpression: 'Cron expression', timezone: 'Timezone', runAt: 'Run at',
     maxRuns: 'Max runs', timeoutSeconds: 'Timeout (seconds)', cooldownMinutes: 'Cooldown (minutes)', enabled: 'Enabled', save: 'Save', cancel: 'Cancel',
-    recentRuns: 'Recent runs', started: 'Started', schedule: 'Schedule', status: 'Status', deliveredPrompt: 'Delivered prompt', detail: 'Detail',
+    recentRuns: 'Recent runs', runHistory: 'Run history', started: 'Started', schedule: 'Schedule', status: 'Status', deliveredPrompt: 'Delivered prompt', detail: 'Detail',
     editTitle: id => `Edit ${id}`, edit: 'Edit', pause: 'Pause', resume: 'Resume', delete: 'Delete', confirmDelete: id => `Delete schedule ${id}? Run receipts are kept.`,
     pending: 'pending', enabledBadge: 'enabled', paused: 'paused', noSchedules: 'No schedules.', commandTarget: 'Command target — edit with the CLI',
-    daemonRunning: pid => `Daemon running (pid ${pid})`, daemonStopped: 'Daemon not running — schedules fire only after `start`',
+    daemonRunning: pid => `Daemon running (pid ${pid})`, daemonStopped: 'Daemon is stopping',
     loading: 'Loading…', selectTerminal: 'Select a terminal', noAgent: '[no running agent]', notListed: 'not currently listed', selectFirst: 'Select a terminal first',
     once_: when => `once ${when}`, every: min => `every ${min} min`, cron: (e, tz) => `cron ${e} (${tz})`,
     noToken: 'Open the URL printed by `agent-scheduler ui`; it carries the access token.', screenLabel: 'Recent terminal screen',
@@ -136,10 +147,10 @@ const messages = {
     promptHelp: '수신 세션이 할 일을 사람이 검토할 수 있는 문장으로 씁니다: 목적, 확인할 대상, 완료 기준, 막혔을 때 할 일. 입력한 문장이 그대로 저장되고 전달되며, 줄바꿈은 공백이 됩니다.',
     interval: '반복 간격', once: '한 번', intervalMinutes: '간격(분)', cronExpression: 'Cron 식', timezone: '시간대', runAt: '실행 시각',
     maxRuns: '최대 실행 횟수', timeoutSeconds: '제한 시간(초)', cooldownMinutes: '최소 간격(분)', enabled: '사용', save: '저장', cancel: '취소',
-    recentRuns: '최근 실행 기록', started: '시작', schedule: '스케줄', status: '결과', deliveredPrompt: '전달된 프롬프트', detail: '상세',
+    recentRuns: '최근 실행 기록', runHistory: '실행 기록', started: '시작', schedule: '스케줄', status: '결과', deliveredPrompt: '전달된 프롬프트', detail: '상세',
     editTitle: id => `${id} 수정`, edit: '수정', pause: '일시정지', resume: '재개', delete: '삭제', confirmDelete: id => `${id} 스케줄을 삭제할까요? 실행 기록은 남습니다.`,
     pending: '확인 필요', enabledBadge: '사용 중', paused: '일시정지', noSchedules: '스케줄이 없습니다.', commandTarget: '명령 대상 — CLI 로 수정',
-    daemonRunning: pid => `데몬 실행 중 (pid ${pid})`, daemonStopped: '데몬이 꺼져 있습니다 — `start` 후에 실행됩니다',
+    daemonRunning: pid => `데몬 실행 중 (pid ${pid})`, daemonStopped: '데몬이 종료 중입니다',
     loading: '불러오는 중…', selectTerminal: '터미널을 선택하세요', noAgent: '[실행 중인 에이전트 없음]', notListed: '현재 목록에 없음', selectFirst: '먼저 터미널을 선택하세요',
     once_: when => `한 번 ${when}`, every: min => `${min}분마다`, cron: (e, tz) => `cron ${e} (${tz})`,
     noToken: '`agent-scheduler ui` 가 출력한 주소로 여세요. 그 주소에 접근 토큰이 들어 있습니다.', screenLabel: '최근 터미널 화면',
@@ -148,7 +159,7 @@ const messages = {
 const token = new URLSearchParams(location.hash.slice(1)).get('token');
 const $ = id => document.getElementById(id);
 const form = $('form');
-let schedules = [], editing = null, lastError = null, receivers = new Map();
+let schedules = [], editing = null, lastError = null, receivers = new Map(), labelsRequested = false;
 let lang = localStorage.getItem('lang') ?? (navigator.language?.startsWith('ko') ? 'ko' : 'en');
 const t = (key, ...args) => { const value = messages[lang][key]; return typeof value === 'function' ? value(...args) : value; };
 
@@ -190,7 +201,9 @@ const button = (label, variant, onClick, disabled) => { const b = document.creat
 async function refresh() {
   clearError();
   try {
-    const [list, runs, status] = await Promise.all([api('GET', '/api/schedules'), api('GET', '/api/history'), api('GET', '/api/status'), receivers.size ? null : remember(api('GET', '/api/terminals')).catch(() => null)]);
+    // Receiver names arrive later; schedules render first and are relabelled once they load.
+    if (!labelsRequested) { labelsRequested = true; remember(api('GET', '/api/terminals')).then(refresh, () => {}); }
+    const [list, runs, status] = await Promise.all([api('GET', '/api/schedules'), api('GET', '/api/history'), api('GET', '/api/status')]);
     schedules = list;
     $('status').textContent = `${status.daemon ? t('daemonRunning', status.daemon.pid) : t('daemonStopped')} · ${status.store}`;
     const body = $('schedules'); body.replaceChildren();
@@ -287,6 +300,24 @@ form.addEventListener('submit', async event => {
     $('editor').hidden = true; editing = null; await refresh();
   } catch (error) { fail(error); }
 });
+const tabs = [$('tab-schedules'), $('tab-runs')];
+function selectTab(tab, focus) {
+  for (const t of tabs) {
+    const selected = t === tab;
+    t.setAttribute('aria-selected', String(selected)); t.tabIndex = selected ? 0 : -1;
+    $(t.getAttribute('aria-controls')).hidden = !selected;
+  }
+  localStorage.setItem('tab', tab.id);
+  if (focus) tab.focus();
+}
+for (const t of tabs) {
+  t.addEventListener('click', () => selectTab(t));
+  t.addEventListener('keydown', e => {
+    const i = tabs.indexOf(t), next = e.key === 'ArrowRight' ? tabs[(i + 1) % tabs.length] : e.key === 'ArrowLeft' ? tabs[(i + tabs.length - 1) % tabs.length] : e.key === 'Home' ? tabs[0] : e.key === 'End' ? tabs.at(-1) : null;
+    if (next) { e.preventDefault(); selectTab(next, true); }
+  });
+}
+selectTab($(localStorage.getItem('tab') ?? 'tab-schedules') ?? tabs[0]);
 applyTheme(); applyLanguage();
 if (!token) fail({ key: 'noToken' });
 else refresh();

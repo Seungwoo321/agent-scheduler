@@ -29,11 +29,15 @@ Start a new Codex session to discover the plugin's `schedule` skill. Both provid
 Standalone CLI from a [GitHub release](https://github.com/Seungwoo321/agent-scheduler/releases):
 
 ```sh
-npm install -g ./seungwoo321-agent-scheduler-0.2.0.tgz
+npm install -g ./seungwoo321-agent-scheduler-0.3.0.tgz
 agent-scheduler --help
 ```
 
 The package is distributed as a GitHub release asset; npm registry publication is not required. Verify the downloaded asset against the release's `SHA256SUMS`.
+
+## Upgrade to 0.3.0
+
+0.3.0 removes `--store`: every session uses the one global store and daemon. Before upgrading, run `list` on the global store and `pause` or `remove` enabled definitions you no longer want: the first `put`, `resume`, `ui` or `start` starts the global daemon, which fires every enabled, unexpired schedule with runs left. Move definitions from any project store into the global store with `put`, stop the project daemons with the old version, then reinstall as below. The daemon no longer inherits the starting session's terminal identity or provider home, so a `command` that needs a provider home must set it in its argv.
 
 ## Upgrade from 0.1.0
 
@@ -101,7 +105,6 @@ Save `schedule.json` with a future expiry and paths appropriate for your compute
 
 ```sh
 agent-scheduler put schedule.json
-agent-scheduler start
 agent-scheduler list
 agent-scheduler history
 agent-scheduler pause local-check
@@ -109,7 +112,7 @@ agent-scheduler remove local-check
 agent-scheduler stop
 ```
 
-The plugin skill runs these commands with `node <installed-plugin>/dist/cli.mjs`. Use `--store /absolute/path` or `AGENT_SCHEDULER_HOME` to isolate a project. The default is `~/.local/state/agent-scheduler`. `serve` runs in the foreground; `start` runs detached. The computer and daemon must remain running; no login service is installed automatically.
+The plugin skill runs these commands with `node <installed-plugin>/dist/cli.mjs`. Every session, coding agent and provider home on this computer shares one store (`~/.local/state/agent-scheduler`) and one daemon. `put` and `resume` start the daemon when it is absent; it runs detached in the background, independent of the session that started it, until `stop`. `start` starts it explicitly and `serve` runs it in the foreground. The computer must remain running; no login service is installed automatically.
 
 ## Targets
 
@@ -126,15 +129,17 @@ Prompts are written at registration from the actual task context and stored verb
 
 ## Manage on the web
 
+The daemon serves the page at `http://127.0.0.1:47800/`. Print the URL with its access token (starting the daemon if needed):
+
 ```sh
 agent-scheduler ui
 ```
 
-Open the printed `http://127.0.0.1:<port>/#token=…` URL. The page lists schedules, their state and recent receipts with the delivered prompt. It registers and edits terminal schedules by choosing a receiver from the running sessions, with the receiver's recent screen as context for writing the prompt, and pauses, resumes and deletes any schedule. Command targets run arbitrary programs, so they are registered and edited only with the CLI. The page supports Korean and English and light, dark or system theme. It listens on loopback only and API calls require the token.
+The token is stored with the store and stays the same across daemon restarts; only `ui` prints it. If the port is taken, `ui` fails and `status` shows why while scheduling continues. The page has Schedules and Run history tabs and uses the full window width. It lists schedules, their state and recent receipts with the delivered prompt. It registers and edits terminal schedules by choosing a receiver from the running sessions, with the receiver's recent screen as context for writing the prompt, and pauses, resumes and deletes any schedule. Command targets run arbitrary programs, so they are registered and edited only with the CLI. The page supports Korean and English and light, dark or system theme. It listens on loopback only and API calls require the token.
 
 ## Reliability
 
-One-shot timestamps, intervals, and cron with explicit timezones are supported. Each schedule has a finite run budget and expiry. Missed recurring occurrences coalesce into one execution. One daemon owns each store; pending execution is serialized per destination. An intent and execution budget are persisted before effects, with the exact claimed definition retained in the receipt.
+One-shot timestamps, intervals, and cron with explicit timezones are supported. Each schedule has a finite run budget and expiry. Missed recurring occurrences coalesce into one execution. One global daemon owns the store; pending execution is serialized per destination. An intent and execution budget are persisted before effects, with the exact claimed definition retained in the receipt.
 
 Ambiguous submission or a process crash leaves the run pending without automatic replay. Inspect actual effects, stop the owner, and acknowledge using `resolve ID RUN`. Failed commands are conservatively uncertain because they may have produced effects. Lock recovery rejects live/unknown owners. This provides at-most-once automatic attempts, not exactly-once external effects.
 

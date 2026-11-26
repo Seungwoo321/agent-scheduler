@@ -39,6 +39,18 @@ export function nextDue(spec, now) {
   try { return cron.nextRun(new Date(now))?.toISOString() ?? null; } finally { cron.stop(); }
 }
 
+// The daemon serves every session alike, so it must not inherit the terminal identity, agent
+// session markers or provider home of whichever session happened to start it.
+export function daemonEnvironment(env) {
+  const result = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (/^(CMUX_|ORCA_|TMUX|CLAUDECODE$|CLAUDE_CODE_|CLAUDE_CONFIG_DIR$|CLAUDE_PLUGIN_|CODEX_)/.test(key)) continue;
+    result[key] = value;
+  }
+  if (result.PATH) result.PATH = result.PATH.split(':').filter(entry => !/cmux-cli-shims/.test(entry)).join(':');
+  return result;
+}
+
 export class Store {
   constructor(root) { this.root = resolve(root); }
   async init() {
@@ -80,6 +92,11 @@ export class Store {
       await this.atomic(join(path, 'owner.json'), { pid: process.pid, host: hostname(), startedAt: iso(Date.now()) });
       return await fn();
     } finally { await rm(path, { recursive: true }); }
+  }
+  // The live daemon owner on this host, or null; a stale lock does not count.
+  async daemon() {
+    const owner = await this.read(join(this.root, 'daemon.lock', 'owner.json'));
+    return owner && owner.host === hostname() && Number.isSafeInteger(owner.pid) && alive(owner.pid) && !(await this.read(join(this.root, 'daemon.lock', 'stop.json'))) ? owner : null;
   }
   async unlock(name) {
     if (!['store', 'daemon'].includes(name)) throw new Error('Unknown lock');
