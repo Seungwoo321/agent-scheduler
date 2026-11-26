@@ -834,6 +834,57 @@ var json = (output) => {
     return null;
   }
 };
+var sleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
+var emptyInput = (left) => /^\s*[❯›>]\s*$/.test(left);
+var ready = ({ left, right, busy }) => busy ? { ok: false, reason: "agent is working" } : !emptyInput(left) || right.trim() ? { ok: false, reason: "input line holds unsubmitted text" } : { ok: true };
+var working = (text2) => /esc to interrupt/i.test(text2);
+var STATUS_ROWS_ABOVE = 6;
+var rowsText = (spans, fromRow) => {
+  const rows = /* @__PURE__ */ new Map();
+  for (const span of spans) if (span.row >= fromRow) (rows.get(span.row) ?? rows.set(span.row, []).get(span.row)).push(span);
+  return [...rows.entries()].sort((a, b2) => a[0] - b2[0]).map(([, row]) => {
+    let text2 = "", end = 0;
+    for (const span of row.sort((a, b2) => a.column - b2.column)) {
+      text2 += " ".repeat(Math.max(0, span.column - end)) + span.text;
+      end = span.column + (span.cell_width ?? [...span.text].length);
+    }
+    return text2;
+  }).join("\n");
+};
+var wide = (cp) => cp >= 4352 && cp <= 4447 || cp >= 11904 && cp <= 42191 || cp >= 44032 && cp <= 55203 || cp >= 63744 && cp <= 64255 || cp >= 65072 && cp <= 65103 || cp >= 65280 && cp <= 65376 || cp >= 65504 && cp <= 65510 || cp >= 127744 && cp <= 129791 || cp >= 131072;
+async function confirmCleared(read) {
+  for (let i3 = 0; i3 < 20; i3++) {
+    await sleep(250);
+    const state = await read().catch(() => null);
+    if (state && emptyInput(state.left) && !state.right.trim()) return true;
+  }
+  return false;
+}
+function splitStyled(line, cells) {
+  let left = "", right = "", used = 0, faint = false;
+  for (const part of line.split(/(\x1b\[[0-9;:]*m)/)) {
+    const sgr = part.match(/^\x1b\[([0-9;:]*)m$/);
+    if (sgr) {
+      const codes = (sgr[1] || "0").split(";");
+      for (let i3 = 0; i3 < codes.length; i3++) {
+        const code = Number(codes[i3].split(":")[0]);
+        if ([38, 48, 58].includes(code) && !codes[i3].includes(":")) {
+          i3 += codes[i3 + 1] === "5" ? 2 : codes[i3 + 1] === "2" ? 4 : 0;
+          continue;
+        }
+        if (code === 2) faint = true;
+        else if (code === 0 || code === 22) faint = false;
+      }
+      continue;
+    }
+    for (const ch of part) {
+      if (used < cells) left += ch;
+      else if (!faint) right += ch;
+      used += wide(ch.codePointAt(0)) ? 2 : 1;
+    }
+  }
+  return { left, right };
+}
 var terminals = {
   cmux: {
     fields: ["workspace", "surface"],
@@ -854,10 +905,25 @@ var terminals = {
         if (!live.some((r) => r.pid === t.agent.pid) || starts.get(t.agent.pid) !== t.agent.startedAt) throw gone("The registered agent process no longer runs on the cmux surface");
       }
     },
+    async input(call, t) {
+      const grid = json((await call(["cmux", "rpc", "terminal.replay", JSON.stringify({ workspace_id: t.workspace, surface_id: t.surface })], { maxOutput: 16 << 20 })).output)?.render_grid;
+      if (!grid?.cursor) throw new Error("cmux render grid unavailable");
+      const faint = new Set((grid.styles ?? []).filter((style) => style.faint).map((style) => style.id));
+      const row = (grid.row_spans ?? []).filter((span) => span.row === grid.cursor.row).sort((a, b2) => a.column - b2.column);
+      return {
+        left: row.filter((span) => span.column < grid.cursor.column).map((span) => span.text).join(""),
+        right: row.filter((span) => span.column >= grid.cursor.column && !faint.has(span.style_id)).map((span) => span.text).join(""),
+        busy: working(rowsText(grid.row_spans ?? [], grid.cursor.row - STATUS_ROWS_ABOVE))
+      };
+    },
+    async ready(call, t) {
+      return ready(await this.input(call, t));
+    },
     async submit(call, t, prompt) {
       await call(["cmux", "rpc", "surface.send_text", JSON.stringify({ workspace_id: t.workspace, surface_id: t.surface, text: prompt })]);
-      await new Promise((resolve2) => setTimeout(resolve2, 250));
+      await sleep(250);
       await call(["cmux", "send-key", "--workspace", t.workspace, "--surface", t.surface, "Enter"]);
+      return { confirmed: await confirmCleared(() => this.input(call, t)), proof: "input-line-cleared" };
     },
     fromEnv: async (env) => env.CMUX_WORKSPACE_ID && env.CMUX_SURFACE_ID ? { workspace: env.CMUX_WORKSPACE_ID, surface: env.CMUX_SURFACE_ID } : null,
     async read(call, t) {
@@ -892,9 +958,24 @@ var terminals = {
       const terminal = shown?.result?.terminal ?? shown?.result ?? shown;
       if (!terminal?.agentIdentity) throw gone("No running agent in the orca terminal");
     },
+    async ready(call, t) {
+      const waited = await call(["orca", "terminal", "wait", "--terminal", t.terminal, "--for", "tui-idle", "--timeout-ms", "2000", "--json"]).catch((error) => error);
+      return waited instanceof Error ? { ok: false, reason: `agent is not idle (${waited.message})` } : { ok: true };
+    },
     async submit(call, t, prompt) {
-      const sent = json((await call(["orca", "terminal", "send", "--terminal", t.terminal, "--text", prompt, "--enter", "--json"])).output);
+      const sent = json((await call(["orca", "terminal", "send", "--terminal", t.terminal, "--text", prompt, "--enter", "--wait-submit", "10", "--json"])).output);
       if (sent?.ok === false) throw new Error(`orca send failed (${sent.error?.code ?? "unknown"})`);
+      const stages = /* @__PURE__ */ new Set();
+      const collect = (value) => {
+        if (Array.isArray(value)) value.forEach(collect);
+        else if (value && typeof value === "object") for (const [key, v2] of Object.entries(value)) {
+          if (/stage/i.test(key)) [v2].flat().forEach((x2) => typeof x2 === "string" ? stages.add(x2) : collect(x2));
+          else collect(v2);
+        }
+      };
+      collect(sent?.result ?? sent);
+      const proof = ["turn_started", "submitted", "submission_observed"].find((stage) => stages.has(stage));
+      return { confirmed: !!proof, proof: proof && `orca-${proof.replace(/_/g, "-")}` };
     },
     async fromEnv(env, call) {
       if (!env.ORCA_PANE_KEY) return null;
@@ -929,10 +1010,21 @@ var terminals = {
       if (pane !== t.pane) throw gone("tmux pane identity mismatch");
       if (shell.test(command2 ?? "")) throw gone("No running agent in the tmux pane");
     },
+    async input(call, t) {
+      const [x2, y2, mode] = (await call(["tmux", "-S", t.socket, "display-message", "-p", "-t", t.pane, "#{cursor_x}	#{cursor_y}	#{pane_in_mode}"])).output.trim().split("	").map(Number);
+      if (!Number.isInteger(x2) || !Number.isInteger(y2)) throw new Error("tmux cursor unavailable");
+      if (mode) return { left: "", right: "", busy: true };
+      const screen = (await call(["tmux", "-S", t.socket, "capture-pane", "-p", "-e", "-t", t.pane])).output.split("\n");
+      return { ...splitStyled(screen[y2] ?? "", x2), busy: working(screen.slice(Math.max(0, y2 - STATUS_ROWS_ABOVE)).join("\n").replace(/\x1b\[[0-9;:]*m/g, "")) };
+    },
+    async ready(call, t) {
+      return ready(await this.input(call, t));
+    },
     async submit(call, t, prompt) {
       await call(["tmux", "-S", t.socket, "send-keys", "-t", t.pane, "-l", "--", prompt]);
-      await new Promise((resolve2) => setTimeout(resolve2, 250));
+      await sleep(250);
       await call(["tmux", "-S", t.socket, "send-keys", "-t", t.pane, "Enter"]);
+      return { confirmed: await confirmCleared(() => this.input(call, t)), proof: "input-line-cleared" };
     },
     fromEnv: async (env) => env.TMUX && env.TMUX_PANE ? { socket: env.TMUX.split(",")[0], pane: env.TMUX_PANE } : null,
     async read(call, t) {
@@ -1051,9 +1143,12 @@ async function dispatch(target, options = {}) {
   } catch (error) {
     return { status: "not-delivered", acknowledgment: "receiver-check-failed-before-input", receiverGone: !!error.receiverGone, error: error.message };
   }
+  const ready2 = await manager.ready(call, target).catch((error) => ({ ok: false, reason: error.message }));
+  if (!ready2.ok) return { status: "not-delivered", acknowledgment: "receiver-not-ready-before-input", receiverGone: false, error: ready2.reason };
   const prompt = target.prompt.replace(/[\r\n]+/g, " ");
-  await manager.submit(call, target, target.mode === "goal" ? `/goal ${prompt}` : prompt);
-  return { status: "transport-accepted", acknowledgment: "delivery-only-not-model-turn" };
+  const sent = await manager.submit(call, target, target.mode === "goal" ? `/goal ${prompt}` : prompt);
+  if (!sent.confirmed) return { status: "uncertain", acknowledgment: "submission-not-confirmed", error: "Input was typed but submission was not observed; inspect the receiver before resolving" };
+  return { status: "transport-accepted", acknowledgment: "submitted-not-model-turn", proof: sent.proof };
 }
 async function listTerminals(options = {}) {
   const call = caller({ timeoutMs: 1e4, maxOutput: 16 << 20, ...options });
@@ -1810,7 +1905,7 @@ async function ensureDaemon() {
 try {
   await store.init();
   if (!command || command === "help" || command === "--help") {
-    console.log(`agent-scheduler 0.3.0 \u2014 Node >=22
+    console.log(`agent-scheduler 0.3.1 \u2014 Node >=22
 
 Usage: agent-scheduler COMMAND
 

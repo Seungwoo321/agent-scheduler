@@ -139,27 +139,109 @@ test('AC-3 recovery mutex prevents parallel stale-owner unlocks', async t => {
   assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
 });
 
-test('AC-2 terminal targets verify a live agent, then send literal text and Enter', async () => {
+// A terminal model: an agent input line with a prompt glyph, typed text left of the cursor, an optional
+// draft right of the cursor, a faint ghost suggestion, a working indicator, and Enter that submits
+// (clears the line) unless the agent leaves pasted text in place.
+function fakeTerminal({ glyph, draft = '', after = '', busy = false, enterSubmits = true, copyMode = false, orcaStages = ['input_accepted', 'turn_started'], pid = 4242, start = 'Thu Nov 26 10:00:00 2026' } = {}) {
   const uuid = '12345678-1234-1234-1234-123456789abc';
-  const live = JSON.stringify({ sessions: [{ surface_id: uuid, stored_pid_exists: true }] });
-  const calls = [], execute = async (argv, options) => {
-    calls.push({ argv, options });
-    const output = argv[0] === 'tmux' ? '%3\tclaude' : argv[1] === 'sessions' ? live : argv[1] === 'terminal' && argv[2] === 'show' ? '{"ok":true,"result":{"terminal":{"agentIdentity":"codex"}}}' : uuid;
-    return { code: 0, output };
+  const term = { draft, after, busy, enterSubmits, pid, start, glyph, typed: [], calls: [] };
+  const width = text => [...text].reduce((n, ch) => n + (ch.codePointAt(0) >= 0x1100 ? 2 : 1), 0);
+  term.execute = async argv => {
+    term.calls.push(argv);
+    const [bin, a1, a2] = argv;
+    const ok = output => ({ code: 0, output });
+    const status = term.busy ? '✻ Working… (esc to interrupt)' : '';
+    if (bin === 'ps') return ok(`${term.pid} ${term.start}\n`);
+    if (bin === 'cmux' && a1 === 'sessions') return ok(JSON.stringify({ sessions: [{ surface_id: uuid, session_id: 's', pid: term.pid, stored_pid_exists: true, agent_lifecycle: 'running' }] }));
+    if (bin === 'cmux' && a1 === 'rpc' && a2 === 'terminal.replay') {
+      const col = 2 + width(term.draft);
+      return ok(JSON.stringify({ render_grid: { cursor: { row: 10, column: col }, styles: [{ id: 0, faint: false }, { id: 9, faint: true }], row_spans: [
+        { row: 0, column: 0, text: 'quoted earlier: esc to interrupt', style_id: 0 },
+        // Codex-style status: the key hint is styled separately from the rest of the phrase.
+        ...(term.busy ? [{ row: 6, column: 0, text: '• Working (5s • ', style_id: 0, cell_width: 16 }, { row: 6, column: 16, text: 'esc', style_id: 9, cell_width: 3 }, { row: 6, column: 19, text: ' to interrupt)', style_id: 0, cell_width: 14 }] : []),
+        { row: 10, column: 0, text: '❯\u00a0', style_id: 0 }, { row: 10, column: 2, text: term.draft, style_id: 0 },
+        { row: 10, column: col, text: term.after, style_id: 0 }, { row: 10, column: col + width(term.after) + 1, text: 'ghost suggestion', style_id: 9 },
+      ] } }));
+    }
+    if (bin === 'cmux' && a1 === 'rpc' && a2 === 'surface.send_text') { const text = JSON.parse(argv[3]).text; term.typed.push(text); term.draft += text; return ok('{}'); }
+    if ((bin === 'cmux' && a1 === 'send-key') || (bin === 'tmux' && argv.at(-1) === 'Enter' && !argv.includes('-l'))) { if (term.enterSubmits) { term.draft = ''; term.after = ''; } return ok(''); }
+    if (bin === 'tmux' && argv.includes('display-message')) return ok(argv.at(-1).includes('cursor_x') ? `${2 + width(term.draft)}\t10\t${copyMode ? 1 : 0}` : '%3\tclaude');
+    if (bin === 'tmux' && argv.includes('capture-pane')) return ok(`said: press esc to interrupt${'\n'.repeat(8)}${status}\n\n${term.glyph ?? '❯'} ${term.draft}${term.after} \x1b[2mghost suggestion\x1b[0m\n`);
+    if (bin === 'tmux' && argv.includes('-l')) { term.typed.push(argv.at(-1)); term.draft += argv.at(-1); return ok(''); }
+    if (bin === 'orca' && a2 === 'show') return ok('{"ok":true,"result":{"terminal":{"agentIdentity":"codex"}}}');
+    if (bin === 'orca' && a2 === 'wait') return term.busy ? { code: 1, output: '{"ok":false,"error":{"message":"timeout"}}' } : ok('{"ok":true}');
+    if (bin === 'orca' && a2 === 'send') { term.typed.push(argv[argv.indexOf('--text') + 1]); return ok(JSON.stringify({ ok: true, result: { request: 'r1', stages: orcaStages } })); }
+    return ok(uuid);
   };
-  assert.equal((await dispatch({ type: 'cmux', surface: uuid, workspace: uuid, prompt: 'first\nsecond\\nend' }, { execute })).status, 'transport-accepted');
-  assert.equal(JSON.parse(calls[2].argv.at(-1)).text, 'first second\\nend'); assert.equal(calls[3].argv.at(-1), 'Enter');
-  calls.length = 0;
-  await dispatch({ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'C-c; $(echo x)' }, { execute });
-  assert.deepEqual(calls[1].argv.slice(-3), ['-l', '--', 'C-c; $(echo x)']);
-  calls.length = 0;
-  const result = await dispatch({ type: 'orca', terminal: 'term_1', mode: 'goal', prompt: 'all tests pass' }, { execute });
-  assert.deepEqual(calls[1].argv, ['orca', 'terminal', 'send', '--terminal', 'term_1', '--text', '/goal all tests pass', '--enter', '--json']);
-  assert.equal(result.acknowledgment, 'delivery-only-not-model-turn');
+  return term;
+}
+
+test('AC-2 terminal targets check the input line, send literal text and Enter, and confirm submission', async () => {
+  const uuid = '12345678-1234-1234-1234-123456789abc';
+  let term = fakeTerminal();
+  const cmux = await dispatch({ type: 'cmux', surface: uuid, workspace: uuid, prompt: 'first\nsecond\\nend' }, { execute: term.execute });
+  assert.equal(cmux.status, 'transport-accepted'); assert.equal(cmux.proof, 'input-line-cleared');
+  assert.deepEqual(term.typed, ['first second\\nend']);
+  term = fakeTerminal();
+  await dispatch({ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'C-c; $(echo x)' }, { execute: term.execute });
+  assert.deepEqual(term.typed, ['C-c; $(echo x)']);
+  term = fakeTerminal();
+  const orca = await dispatch({ type: 'orca', terminal: 'term_1', mode: 'goal', prompt: 'all tests pass' }, { execute: term.execute });
+  assert.ok(term.calls.some(argv => argv.join(' ') === 'orca terminal send --terminal term_1 --text /goal all tests pass --enter --wait-submit 10 --json'));
+  assert.equal(orca.proof, 'orca-turn-started');
   await assert.rejects(dispatch({ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'bad\x1b[2J' }), /Invalid/);
   await assert.rejects(dispatch({ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'bad\tcompletion' }), /Tab/);
   await assert.rejects(dispatch({ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', mode: 'loop', prompt: 'x' }), /mode/);
   await assert.rejects(dispatch({ type: 'codex-queue', home: '/tmp', thread: uuid, prompt: 'x' }), /removed/);
+});
+
+test('AC-2 a draft or a busy agent is never typed over; the occurrence is skipped and the schedule stays enabled', async t => {
+  const uuid = '12345678-1234-1234-1234-123456789abc';
+  for (const [target, state] of [
+    [{ type: 'cmux', surface: uuid, workspace: uuid, prompt: 'check' }, { draft: '다음 https://example.test' }],
+    [{ type: 'cmux', surface: uuid, workspace: uuid, prompt: 'check' }, { busy: true }],
+    [{ type: 'cmux', surface: uuid, workspace: uuid, prompt: 'check' }, { after: '커서 뒤 초안' }],
+    [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { draft: '쓰던 글' }],
+    [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { after: 'draft after cursor' }],
+    [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { glyph: '\x1b[38;2;153;153;153m❯\x1b[39m', after: 'truecolor glyph draft' }],
+    [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { glyph: '\x1b[38;5;2m❯\x1b[39m', after: '256-color glyph draft' }],
+    [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { glyph: '\x1b[48:2::30:30:30m❯', after: 'colon form draft' }],
+    [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { busy: true }],
+    [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { copyMode: true }],
+    [{ type: 'orca', terminal: 'term_1', prompt: 'check' }, { busy: true }],
+  ]) {
+    const term = fakeTerminal(state);
+    const result = await dispatch(target, { execute: term.execute });
+    assert.equal(result.status, 'not-delivered', JSON.stringify(state)); assert.equal(result.receiverGone, false);
+    assert.deepEqual(term.typed, []);
+    if (state.draft || state.after) assert.equal(term.draft + term.after, (state.draft ?? '') + (state.after ?? ''), 'the draft is untouched');
+  }
+  const store = await fixture(t), term = fakeTerminal({ busy: true });
+  await store.put({ ...spec(), trigger: { everyMs: 1000 }, target: { type: 'cmux', surface: uuid, workspace: uuid, prompt: 'check' } });
+  const [run] = await store.tick({ now: Date.now() + 2000, execute: (target, options) => dispatch(target, { ...options, execute: term.execute }) });
+  assert.equal(run.status, 'not-delivered');
+  const [{ spec: saved, state }] = await store.list();
+  assert.equal(saved.enabled, true); assert.equal(state.pending, undefined);
+});
+
+test('AC-2 a stale running lifecycle record does not block an idle receiver; Orca input acceptance alone is not submission', async () => {
+  const uuid = '12345678-1234-1234-1234-123456789abc';
+  assert.equal((await dispatch({ type: 'cmux', surface: uuid, workspace: uuid, prompt: 'check' }, { execute: fakeTerminal().execute })).status, 'transport-accepted');
+  const accepted = fakeTerminal({ orcaStages: ['input_accepted'] });
+  const result = await dispatch({ type: 'orca', terminal: 'term_1', prompt: 'check' }, { execute: accepted.execute });
+  assert.equal(result.status, 'uncertain'); assert.deepEqual(accepted.typed, ['check']);
+});
+
+test('AC-3 an Enter that does not clear the input line is uncertain, stays pending and is never resent', async t => {
+  const store = await fixture(t), uuid = '12345678-1234-1234-1234-123456789abc', term = fakeTerminal({ enterSubmits: false });
+  await store.put({ ...spec(), trigger: { everyMs: 1000 }, target: { type: 'cmux', surface: uuid, workspace: uuid, prompt: 'check' } });
+  const execute = (target, options) => dispatch(target, { ...options, execute: term.execute });
+  const now = Date.now() + 2000;
+  const [run] = await store.tick({ now, execute });
+  assert.equal(run.status, 'uncertain'); assert.equal(run.acknowledgment, 'submission-not-confirmed');
+  assert.deepEqual(await store.tick({ now: now + 5000, execute }), []);
+  assert.deepEqual(term.typed, ['check']);
+  assert.ok((await store.list())[0].state.pending);
 });
 
 test('AC-2 an ended receiver session is not typed into and its schedule is paused', async t => {
@@ -188,19 +270,14 @@ test('AC-2 a cmux schedule follows its agent process across /clear and pauses wh
   const store = await fixture(t), uuid = '12345678-1234-1234-1234-123456789abc';
   const agent = { pid: 4242, startedAt: 'Thu Nov 26 10:00:00 2026' };
   await store.put({ ...spec(), trigger: { everyMs: 1000 }, target: { type: 'cmux', workspace: uuid, surface: uuid, agent, prompt: 'check' } });
-  let record = { surface_id: uuid, session_id: 'after-clear', pid: 4242, stored_pid_exists: true }, sent = 0;
-  const execute = (target, options) => dispatch(target, { ...options, execute: async argv => {
-    if (argv[0] === 'ps') return { code: 0, output: `${record.pid} ${record.pid === 4242 ? agent.startedAt : 'Thu Nov 26 11:00:00 2026'}\n` };
-    if (argv[1] === 'sessions') return { code: 0, output: JSON.stringify({ sessions: [record] }) };
-    if (argv[1] === 'rpc') sent++;
-    return { code: 0, output: uuid };
-  } });
+  const term = fakeTerminal();
+  const execute = (target, options) => dispatch(target, { ...options, execute: term.execute });
   const now = Date.now() + 2000;
   assert.equal((await store.tick({ now, execute }))[0].status, 'transport-accepted');
-  assert.equal(sent, 1);
-  record = { ...record, session_id: 'new-process', pid: 5151 };
+  assert.equal(term.typed.length, 1);
+  Object.assign(term, { pid: 5151, start: 'Thu Nov 26 11:00:00 2026' });
   const [run] = await store.tick({ now: now + 2000, execute });
-  assert.equal(run.receiverGone, true); assert.equal(sent, 1);
+  assert.equal(run.receiverGone, true); assert.equal(term.typed.length, 1);
   assert.equal((await store.list())[0].spec.enabled, false);
 });
 
@@ -244,9 +321,10 @@ test('AC-3 session-end hook keeps schedules on /clear and /resume', async t => {
 });
 
 test('AC-2 partial terminal submission failure does not try another transport', async () => {
-  let calls = 0;
-  await assert.rejects(dispatch({ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'hello' }, { execute: async () => ({ code: ++calls === 3 ? 1 : 0, output: '%3' }) }), /Transport failed/);
-  assert.equal(calls, 3);
+  const term = fakeTerminal(), execute = async argv => argv.at(-1) === 'Enter' ? { code: 1, output: '' } : term.execute(argv);
+  await assert.rejects(dispatch({ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'hello' }, { execute }), /Transport failed/);
+  assert.deepEqual(term.typed, ['hello']);
+  assert.ok(!term.calls.some(argv => argv[0] !== 'tmux'));
 });
 
 test('AC-6 registering starts the one detached daemon, which also serves the management page', async t => {

@@ -18,6 +18,60 @@ async function processStarts(call, pids) {
 }
 const liveRecords = (sessions, surface) => sessions.filter(r => r.surface_id?.toLowerCase() === surface.toLowerCase() && r.stored_pid_exists === true);
 const json = output => { try { return JSON.parse(output); } catch { return null; } };
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// The input line is empty when only the agent's prompt glyph sits left of the cursor and nothing but
+// faint ghost suggestion text sits right of it (a cursor moved to the start of a draft leaves the
+// draft right of the cursor in normal style). Requiring the glyph also refuses a cursor in a menu.
+const emptyInput = left => /^\s*[❯›>]\s*$/.test(left);
+const ready = ({ left, right, busy }) => busy ? { ok: false, reason: 'agent is working' }
+  : !emptyInput(left) || right.trim() ? { ok: false, reason: 'input line holds unsubmitted text' } : { ok: true };
+// Claude Code and Codex both show this while a turn runs (Codex above the input line, Claude below it);
+// agent-hook lifecycle records can go stale. Only rows from six above the input line downward count,
+// so the phrase quoted further up in conversation output does not.
+const working = text => /esc to interrupt/i.test(text);
+const STATUS_ROWS_ABOVE = 6;
+// Rebuild row text from styled spans by cell column; spans split wherever the style changes.
+const rowsText = (spans, fromRow) => {
+  const rows = new Map();
+  for (const span of spans) if (span.row >= fromRow) (rows.get(span.row) ?? rows.set(span.row, []).get(span.row)).push(span);
+  return [...rows.entries()].sort((a, b) => a[0] - b[0]).map(([, row]) => {
+    let text = '', end = 0;
+    for (const span of row.sort((a, b) => a.column - b.column)) { text += ' '.repeat(Math.max(0, span.column - end)) + span.text; end = span.column + (span.cell_width ?? [...span.text].length); }
+    return text;
+  }).join('\n');
+};
+const wide = cp => (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe4f) || (cp >= 0xff00 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1faff) || cp >= 0x20000;
+// Enter is confirmed when the input line returns to empty within a bounded window.
+async function confirmCleared(read) {
+  for (let i = 0; i < 20; i++) {
+    await sleep(250);
+    const state = await read().catch(() => null);
+    if (state && emptyInput(state.left) && !state.right.trim()) return true;
+  }
+  return false;
+}
+// Minimal SGR tracking for `capture-pane -e`: split a line at a cell column and keep only non-faint text right of it.
+function splitStyled(line, cells) {
+  let left = '', right = '', used = 0, faint = false;
+  for (const part of line.split(/(\x1b\[[0-9;:]*m)/)) {
+    const sgr = part.match(/^\x1b\[([0-9;:]*)m$/);
+    if (sgr) {
+      const codes = (sgr[1] || '0').split(';');
+      for (let i = 0; i < codes.length; i++) {
+        const code = Number(codes[i].split(':')[0]);
+        // Extended colors carry their own parameters (38;5;n or 38;2;r;g;b); a colon form is one parameter.
+        if ([38, 48, 58].includes(code) && !codes[i].includes(':')) { i += codes[i + 1] === '5' ? 2 : codes[i + 1] === '2' ? 4 : 0; continue; }
+        if (code === 2) faint = true; else if (code === 0 || code === 22) faint = false;
+      }
+      continue;
+    }
+    for (const ch of part) {
+      if (used < cells) left += ch; else if (!faint) right += ch;
+      used += wide(ch.codePointAt(0)) ? 2 : 1;
+    }
+  }
+  return { left, right };
+}
 
 // Terminal managers differ in addressing and transport; the scheduler contract is the same for every
 // coding agent running inside them: verify the exact receiver, submit literal text, press Enter.
@@ -41,11 +95,24 @@ export const terminals = {
         if (!live.some(r => r.pid === t.agent.pid) || starts.get(t.agent.pid) !== t.agent.startedAt) throw gone('The registered agent process no longer runs on the cmux surface');
       }
     },
+    async input(call, t) {
+      const grid = json((await call(['cmux', 'rpc', 'terminal.replay', JSON.stringify({ workspace_id: t.workspace, surface_id: t.surface })], { maxOutput: 16 << 20 })).output)?.render_grid;
+      if (!grid?.cursor) throw new Error('cmux render grid unavailable');
+      const faint = new Set((grid.styles ?? []).filter(style => style.faint).map(style => style.id));
+      const row = (grid.row_spans ?? []).filter(span => span.row === grid.cursor.row).sort((a, b) => a.column - b.column);
+      return {
+        left: row.filter(span => span.column < grid.cursor.column).map(span => span.text).join(''),
+        right: row.filter(span => span.column >= grid.cursor.column && !faint.has(span.style_id)).map(span => span.text).join(''),
+        busy: working(rowsText(grid.row_spans ?? [], grid.cursor.row - STATUS_ROWS_ABOVE)),
+      };
+    },
+    async ready(call, t) { return ready(await this.input(call, t)); },
     async submit(call, t, prompt) {
       // The send CLI expands backslash-n/r/t. RPC sends literal text.
       await call(['cmux', 'rpc', 'surface.send_text', JSON.stringify({ workspace_id: t.workspace, surface_id: t.surface, text: prompt })]);
-      await new Promise(resolve => setTimeout(resolve, 250));
+      await sleep(250);
       await call(['cmux', 'send-key', '--workspace', t.workspace, '--surface', t.surface, 'Enter']);
+      return { confirmed: await confirmCleared(() => this.input(call, t)), proof: 'input-line-cleared' };
     },
     fromEnv: async env => env.CMUX_WORKSPACE_ID && env.CMUX_SURFACE_ID ? { workspace: env.CMUX_WORKSPACE_ID, surface: env.CMUX_SURFACE_ID } : null,
     async read(call, t) { return (await call(['cmux', 'read-screen', '--workspace', t.workspace, '--surface', t.surface, '--lines', '40'])).output; },
@@ -76,9 +143,21 @@ export const terminals = {
       const terminal = shown?.result?.terminal ?? shown?.result ?? shown;
       if (!terminal?.agentIdentity) throw gone('No running agent in the orca terminal');
     },
+    async ready(call, t) {
+      // Orca reports TUI idleness; it does not expose the input line, so drafts cannot be detected here.
+      const waited = await call(['orca', 'terminal', 'wait', '--terminal', t.terminal, '--for', 'tui-idle', '--timeout-ms', '2000', '--json']).catch(error => error);
+      return waited instanceof Error ? { ok: false, reason: `agent is not idle (${waited.message})` } : { ok: true };
+    },
     async submit(call, t, prompt) {
-      const sent = json((await call(['orca', 'terminal', 'send', '--terminal', t.terminal, '--text', prompt, '--enter', '--json'])).output);
+      // --wait-submit observes the same accepted prompt and never resends; stages prove acceptance and turn start.
+      const sent = json((await call(['orca', 'terminal', 'send', '--terminal', t.terminal, '--text', prompt, '--enter', '--wait-submit', '10', '--json'])).output);
       if (sent?.ok === false) throw new Error(`orca send failed (${sent.error?.code ?? 'unknown'})`);
+      // input_accepted only means the PTY received the text; only an observed submission or turn start counts.
+      const stages = new Set();
+      const collect = value => { if (Array.isArray(value)) value.forEach(collect); else if (value && typeof value === 'object') for (const [key, v] of Object.entries(value)) { if (/stage/i.test(key)) [v].flat().forEach(x => typeof x === 'string' ? stages.add(x) : collect(x)); else collect(v); } };
+      collect(sent?.result ?? sent);
+      const proof = ['turn_started', 'submitted', 'submission_observed'].find(stage => stages.has(stage));
+      return { confirmed: !!proof, proof: proof && `orca-${proof.replace(/_/g, '-')}` };
     },
     async fromEnv(env, call) {
       // Orca exports the pane key; the runtime maps it to the current terminal handle.
@@ -112,10 +191,20 @@ export const terminals = {
       // A shell in the foreground means the agent exited; typed text would run as a command.
       if (shell.test(command ?? '')) throw gone('No running agent in the tmux pane');
     },
+    async input(call, t) {
+      const [x, y, mode] = (await call(['tmux', '-S', t.socket, 'display-message', '-p', '-t', t.pane, '#{cursor_x}\t#{cursor_y}\t#{pane_in_mode}'])).output.trim().split('\t').map(Number);
+      if (!Number.isInteger(x) || !Number.isInteger(y)) throw new Error('tmux cursor unavailable');
+      // In copy mode typed keys become copy-mode commands.
+      if (mode) return { left: '', right: '', busy: true };
+      const screen = (await call(['tmux', '-S', t.socket, 'capture-pane', '-p', '-e', '-t', t.pane])).output.split('\n');
+      return { ...splitStyled(screen[y] ?? '', x), busy: working(screen.slice(Math.max(0, y - STATUS_ROWS_ABOVE)).join('\n').replace(/\x1b\[[0-9;:]*m/g, '')) };
+    },
+    async ready(call, t) { return ready(await this.input(call, t)); },
     async submit(call, t, prompt) {
       await call(['tmux', '-S', t.socket, 'send-keys', '-t', t.pane, '-l', '--', prompt]);
-      await new Promise(resolve => setTimeout(resolve, 250));
+      await sleep(250);
       await call(['tmux', '-S', t.socket, 'send-keys', '-t', t.pane, 'Enter']);
+      return { confirmed: await confirmCleared(() => this.input(call, t)), proof: 'input-line-cleared' };
     },
     fromEnv: async env => env.TMUX && env.TMUX_PANE ? { socket: env.TMUX.split(',')[0], pane: env.TMUX_PANE } : null,
     async read(call, t) { return (await call(['tmux', '-S', t.socket, 'capture-pane', '-p', '-t', t.pane, '-S', '-40'])).output; },
@@ -209,11 +298,16 @@ export async function dispatch(target, options = {}) {
   const manager = terminals[target.type];
   try { await manager.verify(call, target); }
   catch (error) { return { status: 'not-delivered', acknowledgment: 'receiver-check-failed-before-input', receiverGone: !!error.receiverGone, error: error.message }; }
+  // Never type over a draft or into a busy agent: skip this occurrence without input; the schedule stays enabled.
+  const ready = await manager.ready(call, target).catch(error => ({ ok: false, reason: error.message }));
+  if (!ready.ok) return { status: 'not-delivered', acknowledgment: 'receiver-not-ready-before-input', receiverGone: false, error: ready.reason };
   // Flatten newlines and reject terminal control characters before the effect.
   const prompt = target.prompt.replace(/[\r\n]+/g, ' ');
   // Claude Code and Codex both accept `/goal <objective>`: the session keeps working until the objective holds.
-  await manager.submit(call, target, target.mode === 'goal' ? `/goal ${prompt}` : prompt);
-  return { status: 'transport-accepted', acknowledgment: 'delivery-only-not-model-turn' };
+  const sent = await manager.submit(call, target, target.mode === 'goal' ? `/goal ${prompt}` : prompt);
+  // Unconfirmed submission may have left text in the input line; keep it pending and never resend.
+  if (!sent.confirmed) return { status: 'uncertain', acknowledgment: 'submission-not-confirmed', error: 'Input was typed but submission was not observed; inspect the receiver before resolving' };
+  return { status: 'transport-accepted', acknowledgment: 'submitted-not-model-turn', proof: sent.proof };
 }
 
 export async function listTerminals(options = {}) {

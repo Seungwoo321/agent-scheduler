@@ -29,7 +29,7 @@ Start a new Codex session to discover the plugin's `schedule` skill. Both provid
 Standalone CLI from a [GitHub release](https://github.com/Seungwoo321/agent-scheduler/releases):
 
 ```sh
-npm install -g ./seungwoo321-agent-scheduler-0.3.0.tgz
+npm install -g ./seungwoo321-agent-scheduler-0.3.1.tgz
 agent-scheduler --help
 ```
 
@@ -119,11 +119,11 @@ The plugin skill runs these commands with `node <installed-plugin>/dist/cli.mjs`
 | Target | Delivery | Acknowledgment |
 | --- | --- | --- |
 | `command` | Executable and argument array, no shell | Command exited zero |
-| `cmux` | Literal text RPC to workspace/surface UUID, then Enter | Transport accepted |
-| `orca` | `orca terminal send --enter` to a runtime terminal handle | Transport accepted |
-| `tmux` | Literal text to an exact pane, then Enter | Transport accepted |
+| `cmux` | Literal text RPC to workspace/surface UUID, then Enter | Input line cleared after Enter |
+| `orca` | `orca terminal send --enter --wait-submit` to a runtime terminal handle | Orca submission or `turn_started` stage |
+| `tmux` | Literal text to an exact pane, then Enter | Input line cleared after Enter |
 
-Every terminal target is verified before input: the terminal must exist and a coding agent must still run in it. Otherwise nothing is typed; an absent receiver pauses the schedule, while a failed check (shutdown, timeout) leaves it enabled. `mode: "goal"` delivers the prompt as `/goal <prompt>` for Claude Code and Codex alike. When a receiving session ends (not on `/clear` or `/resume`), the plugin's `SessionEnd` hook removes the schedules addressed to its terminal; a cmux schedule bound to its `agent` process is removed only when that process ends.
+Every terminal target is verified before input: the terminal must exist and a coding agent must still run in it. Otherwise nothing is typed; an absent receiver pauses the schedule, while a failed check (shutdown, timeout) leaves it enabled. Text is typed only when the agent is not working and its input line is empty (cmux and tmux read the cursor row; Orca only reports idleness and cannot see a draft); a busy or drafting receiver skips that occurrence, which still counts toward `maxRuns`. After Enter the submission must be observed, otherwise the run is `uncertain` and is never resent automatically. `mode: "goal"` delivers the prompt as `/goal <prompt>` for Claude Code and Codex alike. When a receiving session ends (not on `/clear` or `/resume`), the plugin's `SessionEnd` hook removes the schedules addressed to its terminal; a cmux schedule bound to its `agent` process is removed only when that process ends.
 
 Prompts are written at registration from the actual task context and stored verbatim, so every delivered instruction is readable in the definition and receipts. Transport acceptance does **not** prove a model turn started or finished. The engine does not judge tasks, merge PRs, or mark work complete.
 
