@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/cli.mjs
-import { readFile as readFile3, open as open2 } from "node:fs/promises";
+import { readFile as readFile3, open as open2, link, rm as rm2 } from "node:fs/promises";
 import { randomBytes as randomBytes2 } from "node:crypto";
 import { join as join3 } from "node:path";
 import { homedir } from "node:os";
@@ -1132,6 +1132,15 @@ function nextDue(spec, now) {
     cron.stop();
   }
 }
+function daemonEnvironment(env) {
+  const result = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (/^(CMUX_|ORCA_|TMUX|CLAUDECODE$|CLAUDE_CODE_|CLAUDE_CONFIG_DIR$|CLAUDE_PLUGIN_|CODEX_)/.test(key)) continue;
+    result[key] = value;
+  }
+  if (result.PATH) result.PATH = result.PATH.split(":").filter((entry) => !/cmux-cli-shims/.test(entry)).join(":");
+  return result;
+}
 var Store = class {
   constructor(root2) {
     this.root = resolve(root2);
@@ -1742,34 +1751,54 @@ var print = (value) => process.stdout.write(JSON.stringify(value, null, 2) + "\n
 var port = Number(process.env.AGENT_SCHEDULER_PORT ?? 47800);
 async function uiToken() {
   const path = join3(store.root, "ui-token");
-  const existing = (await readFile3(path, "utf8").catch(() => "")).trim();
-  if (existing) return existing;
-  const token = randomBytes2(24).toString("base64url");
-  const file = await open2(path, "wx", 384).catch(() => null);
-  if (!file) return (await readFile3(path, "utf8")).trim();
+  const read = async () => (await readFile3(path, "utf8").catch(() => "")).trim();
+  if (await read()) return read();
+  const temp = `${path}.${process.pid}.${randomBytes2(4).toString("hex")}.tmp`;
+  const file = await open2(temp, "wx", 384);
   try {
-    await file.writeFile(token);
+    await file.writeFile(randomBytes2(24).toString("base64url"));
+    await file.sync();
   } finally {
     await file.close();
   }
+  await link(temp, path).catch((error) => {
+    if (error.code !== "EEXIST") throw error;
+  });
+  await rm2(temp, { force: true });
+  const token = await read();
+  if (!token) throw new Error("Management page token is empty");
   return token;
 }
-var uiUrl = async () => `http://127.0.0.1:${port}/#token=${await uiToken()}`;
-async function startDaemon() {
-  if (await store.read(join3(store.root, "daemon.lock", "owner.json"))) {
-    if (await store.daemon()) throw new Error("Daemon is already running");
-    await store.unlock("daemon");
+var pagePath = () => join3(store.root, "daemon.lock", "page.json");
+async function page2(waitMs = 0) {
+  const owner = await store.daemon();
+  for (let waited = 0; ; waited += 100) {
+    const state = await store.read(pagePath());
+    if (owner && state?.pid === owner.pid) return state.listening ? { listening: true, url: `http://127.0.0.1:${state.port}/` } : { listening: false, error: state.error };
+    if (waited >= waitMs) return { listening: false, error: owner ? "management page not ready" : "daemon not running" };
+    await new Promise((r) => setTimeout(r, 100));
   }
+}
+async function startDaemon() {
+  const lockOwner = () => store.read(join3(store.root, "daemon.lock", "owner.json"));
+  for (let i3 = 0; i3 < 150 && await lockOwner() && !await store.daemon(); i3++) {
+    if (i3 === 0 || i3 % 10 === 0) await store.unlock("daemon").catch(() => {
+    });
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  const running = await store.daemon();
+  if (running) return { status: "running", ...running };
+  if (await lockOwner()) throw new Error("Daemon lock is held by a stopping or unknown owner; inspect status");
   const log = await open2(join3(store.root, "daemon.log"), "a", 384);
   try {
-    const child = spawn2(process.execPath, [fileURLToPath(import.meta.url), "serve"], { detached: true, stdio: ["ignore", log.fd, log.fd], env: { ...process.env, AGENT_SCHEDULER_HOME: store.root } });
+    const child = spawn2(process.execPath, [fileURLToPath(import.meta.url), "serve"], { detached: true, stdio: ["ignore", log.fd, log.fd], env: { ...daemonEnvironment(process.env), AGENT_SCHEDULER_HOME: store.root } });
     child.unref();
-    for (let i3 = 0; i3 < 30; i3++) {
+    for (let i3 = 0; i3 < 50; i3++) {
       await new Promise((r) => setTimeout(r, 100));
-      const owner = await store.read(join3(store.root, "daemon.lock", "owner.json"));
-      if (owner?.pid === child.pid) return { status: "started", ...owner };
+      const owner = await store.daemon();
+      if (owner) return { status: owner.pid === child.pid ? "started" : "running", ...owner };
     }
-    throw new Error("Daemon did not acquire its lock; inspect daemon.log");
+    throw new Error("Daemon did not start; inspect daemon.log");
   } finally {
     await log.close();
   }
@@ -1815,7 +1844,7 @@ No API key or model process is required.`);
     } else input = await readFile3(rest[0], "utf8");
     const spec = validate(JSON.parse(input));
     const daemon = await ensureDaemon();
-    print({ ...await store.put(spec), daemon, ui: await uiUrl() });
+    print({ ...await store.put(spec), daemon });
   } else if (command === "list") print(await store.list());
   else if (command === "pause" || command === "resume") {
     const daemon = command === "resume" ? await ensureDaemon() : void 0;
@@ -1825,7 +1854,7 @@ No API key or model process is required.`);
   else if (command === "unlock") print(await store.unlock(rest[0]));
   else if (command === "tick") print(await store.tick());
   else if (command === "history") print(await history(store));
-  else if (command === "status") print({ ...await status(store), ui: await uiUrl() });
+  else if (command === "status") print({ ...await status(store), page: await page2() });
   else if (command === "terminals") print(await listTerminals());
   else if (command === "session-end") {
     let input = "";
@@ -1842,20 +1871,20 @@ No API key or model process is required.`);
       const agent = receivers.length ? await agentForSession(hook.session_id) : null;
       print({ receivers, agent, schedules: receivers.length ? await store.removeForReceivers(receivers, agent) : [] });
     }
-  } else if (command === "ui") print({ url: await uiUrl(), daemon: await ensureDaemon(), store: store.root });
-  else if (command === "serve") {
+  } else if (command === "ui") {
+    const daemon = await ensureDaemon();
+    const state = await page2(5e3);
+    if (!state.listening) throw new Error(`Management page unavailable: ${state.error}; see daemon.log`);
+    print({ url: `${state.url}#token=${await uiToken()}`, daemon, store: store.root });
+  } else if (command === "serve") {
     await store.lock("daemon", async () => {
       const { server } = createUi(store, { token: await uiToken() });
-      await new Promise((resolve2) => {
-        server.once("error", (error) => {
-          process.stderr.write(JSON.stringify({ error: `management page unavailable: ${error.message}`, at: (/* @__PURE__ */ new Date()).toISOString() }) + "\n");
-          resolve2();
-        });
-        server.listen(port, "127.0.0.1", () => {
-          print({ ui: `http://127.0.0.1:${port}/`, at: (/* @__PURE__ */ new Date()).toISOString() });
-          resolve2();
-        });
+      const state = await new Promise((resolve2) => {
+        server.once("error", (error) => resolve2({ listening: false, error: error.code ?? error.message }));
+        server.listen(port, "127.0.0.1", () => resolve2({ listening: true }));
       });
+      await store.atomic(pagePath(), { pid: process.pid, port, ...state, at: (/* @__PURE__ */ new Date()).toISOString() });
+      print({ page: state, port, at: (/* @__PURE__ */ new Date()).toISOString() });
       const controller = new AbortController();
       const active = /* @__PURE__ */ new Set();
       let stopping = false;
@@ -1887,7 +1916,7 @@ No API key or model process is required.`);
         process.removeListener("SIGTERM", stop);
       }
     });
-  } else if (command === "start") print({ ...await ensureDaemon(), store: store.root, ui: await uiUrl() });
+  } else if (command === "start") print({ ...await ensureDaemon(), store: store.root, page: await page2(5e3) });
   else if (command === "stop") {
     const path = join3(store.root, "daemon.lock");
     const owner = await store.read(join3(path, "owner.json"));

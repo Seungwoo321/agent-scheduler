@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-import { readFile, open } from 'node:fs/promises';
+import { readFile, open, link, rm } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { Store, validate } from './core.mjs';
+import { Store, validate, daemonEnvironment } from './core.mjs';
 import { agentForSession, currentReceivers, listTerminals } from './targets.mjs';
 import { createUi, history, status } from './ui.mjs';
 
@@ -21,32 +21,53 @@ const port = Number(process.env.AGENT_SCHEDULER_PORT ?? 47800);
 // The management page token persists so the one daemon keeps one stable URL.
 async function uiToken() {
   const path = join(store.root, 'ui-token');
-  const existing = (await readFile(path, 'utf8').catch(() => '')).trim();
-  if (existing) return existing;
-  const token = randomBytes(24).toString('base64url');
-  const file = await open(path, 'wx', 0o600).catch(() => null);
-  if (!file) return (await readFile(path, 'utf8')).trim();
-  try { await file.writeFile(token); } finally { await file.close(); }
+  const read = async () => (await readFile(path, 'utf8').catch(() => '')).trim();
+  if (await read()) return read();
+  // Write a complete temp file, then link it into place, so no reader sees an empty token.
+  const temp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  const file = await open(temp, 'wx', 0o600);
+  try { await file.writeFile(randomBytes(24).toString('base64url')); await file.sync(); } finally { await file.close(); }
+  await link(temp, path).catch(error => { if (error.code !== 'EEXIST') throw error; });
+  await rm(temp, { force: true });
+  const token = await read();
+  if (!token) throw new Error('Management page token is empty');
   return token;
 }
-const uiUrl = async () => `http://127.0.0.1:${port}/#token=${await uiToken()}`;
+const pagePath = () => join(store.root, 'daemon.lock', 'page.json');
+// The URL is reported only when the running daemon actually listens on the port.
+async function page(waitMs = 0) {
+  const owner = await store.daemon();
+  for (let waited = 0; ; waited += 100) {
+    const state = await store.read(pagePath());
+    if (owner && state?.pid === owner.pid) return state.listening ? { listening: true, url: `http://127.0.0.1:${state.port}/` } : { listening: false, error: state.error };
+    if (waited >= waitMs) return { listening: false, error: owner ? 'management page not ready' : 'daemon not running' };
+    await new Promise(r => setTimeout(r, 100));
+  }
+}
 
 // The daemon runs detached in its own process session, independent of the session that started it.
 async function startDaemon() {
-  if (await store.read(join(store.root, 'daemon.lock', 'owner.json'))) {
-    if (await store.daemon()) throw new Error('Daemon is already running');
-    await store.unlock('daemon'); // refuses a live or unknown owner
+  const lockOwner = () => store.read(join(store.root, 'daemon.lock', 'owner.json'));
+  // A stopping daemon is still alive; wait for it to release the lock before replacing it.
+  for (let i = 0; i < 150 && await lockOwner() && !await store.daemon(); i++) {
+    if (i === 0 || i % 10 === 0) await store.unlock('daemon').catch(() => {});
+    await new Promise(r => setTimeout(r, 100));
   }
+  const running = await store.daemon();
+  if (running) return { status: 'running', ...running };
+  if (await lockOwner()) throw new Error('Daemon lock is held by a stopping or unknown owner; inspect status');
   const log = await open(join(store.root, 'daemon.log'), 'a', 0o600);
   try {
-    const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'serve'], { detached: true, stdio: ['ignore', log.fd, log.fd], env: { ...process.env, AGENT_SCHEDULER_HOME: store.root } });
+    // The daemon gets a session-neutral environment: no terminal identity or provider home of the starting session.
+    const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'serve'], { detached: true, stdio: ['ignore', log.fd, log.fd], env: { ...daemonEnvironment(process.env), AGENT_SCHEDULER_HOME: store.root } });
     child.unref();
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 50; i++) {
       await new Promise(r => setTimeout(r, 100));
-      const owner = await store.read(join(store.root, 'daemon.lock', 'owner.json'));
-      if (owner?.pid === child.pid) return { status: 'started', ...owner };
+      // Concurrent starters race for one lock; whichever daemon won serves everyone.
+      const owner = await store.daemon();
+      if (owner) return { status: owner.pid === child.pid ? 'started' : 'running', ...owner };
     }
-    throw new Error('Daemon did not acquire its lock; inspect daemon.log');
+    throw new Error('Daemon did not start; inspect daemon.log');
   } finally { await log.close(); }
 }
 // Registration without a running daemon would never fire, so the registering session starts it.
@@ -65,7 +86,7 @@ try {
     else input = await readFile(rest[0], 'utf8');
     const spec = validate(JSON.parse(input));
     const daemon = await ensureDaemon();
-    print({ ...(await store.put(spec)), daemon, ui: await uiUrl() });
+    print({ ...(await store.put(spec)), daemon });
   } else if (command === 'list') print(await store.list());
   else if (command === 'pause' || command === 'resume') {
     const daemon = command === 'resume' ? await ensureDaemon() : undefined;
@@ -76,7 +97,7 @@ try {
   else if (command === 'unlock') print(await store.unlock(rest[0]));
   else if (command === 'tick') print(await store.tick());
   else if (command === 'history') print(await history(store));
-  else if (command === 'status') print({ ...(await status(store)), ui: await uiUrl() });
+  else if (command === 'status') print({ ...(await status(store)), page: await page() });
   else if (command === 'terminals') print(await listTerminals());
   else if (command === 'session-end') {
     // Hook input carries the ending agent session and its reason; /clear and /resume keep the agent running.
@@ -90,15 +111,23 @@ try {
       const agent = receivers.length ? await agentForSession(hook.session_id) : null;
       print({ receivers, agent, schedules: receivers.length ? await store.removeForReceivers(receivers, agent) : [] });
     }
-  } else if (command === 'ui') print({ url: await uiUrl(), daemon: await ensureDaemon(), store: store.root });
+  } else if (command === 'ui') {
+    const daemon = await ensureDaemon();
+    const state = await page(5000);
+    if (!state.listening) throw new Error(`Management page unavailable: ${state.error}; see daemon.log`);
+    print({ url: `${state.url}#token=${await uiToken()}`, daemon, store: store.root });
+  }
   else if (command === 'serve') {
     await store.lock('daemon', async () => {
       // The daemon serves the management page, so one process owns both scheduling and the page.
       const { server } = createUi(store, { token: await uiToken() });
-      await new Promise(resolve => {
-        server.once('error', error => { process.stderr.write(JSON.stringify({ error: `management page unavailable: ${error.message}`, at: new Date().toISOString() }) + '\n'); resolve(); });
-        server.listen(port, '127.0.0.1', () => { print({ ui: `http://127.0.0.1:${port}/`, at: new Date().toISOString() }); resolve(); });
+      // Scheduling continues without the page; the page state tells `ui` and `status` whether it listens.
+      const state = await new Promise(resolve => {
+        server.once('error', error => resolve({ listening: false, error: error.code ?? error.message }));
+        server.listen(port, '127.0.0.1', () => resolve({ listening: true }));
       });
+      await store.atomic(pagePath(), { pid: process.pid, port, ...state, at: new Date().toISOString() });
+      print({ page: state, port, at: new Date().toISOString() });
       const controller = new AbortController();
       const active = new Set();
       let stopping = false;
@@ -121,7 +150,7 @@ try {
         process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
       }
     });
-  } else if (command === 'start') print({ ...(await ensureDaemon()), store: store.root, ui: await uiUrl() }); else if (command === 'stop') {
+  } else if (command === 'start') print({ ...(await ensureDaemon()), store: store.root, page: await page(5000) }); else if (command === 'stop') {
     // Stop through a file, avoiding signals to a reused PID.
     const path = join(store.root, 'daemon.lock');
     const owner = await store.read(join(path, 'owner.json'));

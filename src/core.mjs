@@ -39,6 +39,18 @@ export function nextDue(spec, now) {
   try { return cron.nextRun(new Date(now))?.toISOString() ?? null; } finally { cron.stop(); }
 }
 
+// The daemon serves every session alike, so it must not inherit the terminal identity, agent
+// session markers or provider home of whichever session happened to start it.
+export function daemonEnvironment(env) {
+  const result = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (/^(CMUX_|ORCA_|TMUX|CLAUDECODE$|CLAUDE_CODE_|CLAUDE_CONFIG_DIR$|CLAUDE_PLUGIN_|CODEX_)/.test(key)) continue;
+    result[key] = value;
+  }
+  if (result.PATH) result.PATH = result.PATH.split(':').filter(entry => !/cmux-cli-shims/.test(entry)).join(':');
+  return result;
+}
+
 export class Store {
   constructor(root) { this.root = resolve(root); }
   async init() {

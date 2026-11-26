@@ -37,7 +37,7 @@ The package is distributed as a GitHub release asset; npm registry publication i
 
 ## Upgrade to 0.3.0
 
-0.3.0 removes `--store`: every session uses the one global store and daemon. Move definitions from any project store into it with `put`, stop the project daemons with the old version, then reinstall as below.
+0.3.0 removes `--store`: every session uses the one global store and daemon. Before upgrading, run `list` on the global store and `pause` or `remove` enabled definitions you no longer want: the first `put`, `resume`, `ui` or `start` starts the global daemon, which fires every enabled, unexpired schedule with runs left. Move definitions from any project store into the global store with `put`, stop the project daemons with the old version, then reinstall as below. The daemon no longer inherits the starting session's terminal identity or provider home, so a `command` that needs a provider home must set it in its argv.
 
 ## Upgrade from 0.1.0
 
@@ -135,7 +135,7 @@ The daemon serves the page at `http://127.0.0.1:47800/`. Print the URL with its 
 agent-scheduler ui
 ```
 
-The token is stored with the store and stays the same across daemon restarts. The page has Schedules and Run history tabs and uses the full window width. It lists schedules, their state and recent receipts with the delivered prompt. It registers and edits terminal schedules by choosing a receiver from the running sessions, with the receiver's recent screen as context for writing the prompt, and pauses, resumes and deletes any schedule. Command targets run arbitrary programs, so they are registered and edited only with the CLI. The page supports Korean and English and light, dark or system theme. It listens on loopback only and API calls require the token.
+The token is stored with the store and stays the same across daemon restarts; only `ui` prints it. If the port is taken, `ui` fails and `status` shows why while scheduling continues. The page has Schedules and Run history tabs and uses the full window width. It lists schedules, their state and recent receipts with the delivered prompt. It registers and edits terminal schedules by choosing a receiver from the running sessions, with the receiver's recent screen as context for writing the prompt, and pauses, resumes and deletes any schedule. Command targets run arbitrary programs, so they are registered and edited only with the CLI. The page supports Korean and English and light, dark or system theme. It listens on loopback only and API calls require the token.
 
 ## Reliability
 
