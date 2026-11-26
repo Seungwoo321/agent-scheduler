@@ -1,6 +1,6 @@
 # Agent Scheduler
 
-A standalone, file-based scheduler for local commands and prompts to existing agent sessions. Claude Code and Codex plugins use the same Node.js engine and local schedule files. No model API, relay, database, or other agent plugin is required. Delivery does not depend on which coding agent CLI runs in the receiving terminal or on that agent's own scheduling features.
+A standalone, file-based scheduler for local commands and prompts to existing coding agent sessions. Claude Code and Codex plugins use the same Node.js engine and local schedule files. Sessions are woken through the terminal manager they run in (cmux, Orca or tmux), so scheduling, delivery, receiver checks and cleanup behave the same whichever coding agent CLI is running and whether or not it has its own scheduling feature. No model API, relay, database, or other agent plugin is required.
 
 Timer ticks do not use model tokens. Delivered prompts can start real model work and consume quota. Use a small command for mechanical checks and wake a supervisor when judgment is needed.
 
@@ -24,7 +24,7 @@ codex plugin marketplace add Seungwoo321/agent-scheduler
 codex plugin add agent-scheduler@agent-scheduler
 ```
 
-Start a new Codex session to discover the plugin's `schedule` skill. Both providers install a bundled runtime and require no dependency installation inside the plugin folder.
+Start a new Codex session to discover the plugin's `schedule` skill. Both providers install a bundled runtime and a `SessionEnd` hook, and require no dependency installation inside the plugin folder.
 
 Standalone CLI from a [GitHub release](https://github.com/Seungwoo321/agent-scheduler/releases):
 
@@ -34,6 +34,49 @@ agent-scheduler --help
 ```
 
 The package is distributed as a GitHub release asset; npm registry publication is not required. Verify the downloaded asset against the release's `SHA256SUMS`.
+
+## Upgrade from 0.1.0
+
+0.2.0 removes the `codex-queue` target. Update the plugin, remove the old cached version, and reload:
+
+```sh
+claude plugin marketplace update agent-scheduler
+claude plugin update agent-scheduler@agent-scheduler
+codex plugin marketplace upgrade agent-scheduler
+codex plugin remove agent-scheduler@agent-scheduler
+codex plugin add agent-scheduler@agent-scheduler
+```
+
+In open Claude Code sessions run `/reload-plugins`; start a new Codex session. Re-register any `codex-queue` schedule as a terminal schedule addressed to the session's cmux, Orca or tmux terminal. A `command` schedule that only wraps a script to type a prompt into a session should also become a terminal schedule, with the prompt written in the definition.
+
+## Wake an agent session
+
+List receivers with their agent, session and working directory, then pick the exact terminal:
+
+```sh
+agent-scheduler terminals
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "release-watch",
+  "enabled": true,
+  "trigger": { "cron": { "expression": "*/20 9-19 * * 1-5", "timezone": "Asia/Seoul" } },
+  "target": {
+    "type": "cmux",
+    "workspace": "12345678-1234-1234-1234-123456789abc",
+    "surface": "12345678-1234-1234-1234-123456789abd",
+    "mode": "prompt",
+    "prompt": "Check PR #42: if CI failed, find the cause and fix it within the approved scope; if review comments arrived, address them; if it is green and approved, report that it is ready and stop."
+  },
+  "maxRuns": 30,
+  "expiresAt": "2027-01-01T09:00:00Z",
+  "timeoutMs": 30000
+}
+```
+
+Write the prompt from the actual task context so a person can review what will be delivered: the goal, what to inspect, the completion criteria, what to do when blocked, and the authorized limits. `mode: "goal"` sends `/goal <prompt>` instead, for an objective the session should keep working on until its condition holds; it replaces the session's current goal.
 
 ## Schedule a command
 
@@ -62,7 +105,6 @@ agent-scheduler start
 agent-scheduler list
 agent-scheduler history
 agent-scheduler pause local-check
-agent-scheduler ui
 agent-scheduler remove local-check
 agent-scheduler stop
 ```
@@ -82,7 +124,13 @@ Every terminal target is verified before input: the terminal must exist and a co
 
 Prompts are written at registration from the actual task context and stored verbatim, so every delivered instruction is readable in the definition and receipts. Transport acceptance does **not** prove a model turn started or finished. The engine does not judge tasks, merge PRs, or mark work complete.
 
-`agent-scheduler ui` serves a local management page; see [the schema](docs/schedules.md#management-page).
+## Manage on the web
+
+```sh
+agent-scheduler ui
+```
+
+Open the printed `http://127.0.0.1:<port>/#token=…` URL. The page lists schedules, their state and recent receipts with the delivered prompt. It registers and edits terminal schedules by choosing a receiver from the running sessions, with the receiver's recent screen as context for writing the prompt, and pauses, resumes and deletes any schedule. Command targets run arbitrary programs, so they are registered and edited only with the CLI. The page supports Korean and English and light, dark or system theme. It listens on loopback only and API calls require the token.
 
 ## Reliability
 
@@ -101,6 +149,6 @@ npm test
 npm run build
 ```
 
-Source lives in `src/`; `dist/cli.mjs` is a self-contained esbuild bundle with Croner. Node's built-in test runner covers persistence, timing, concurrent dispatch, literal input, uncertain effects, and process-tree termination.
+Source lives in `src/`; `dist/cli.mjs` is a self-contained esbuild bundle with Croner. `src/ui.html` is inlined into the bundle at build time. Node's built-in test runner covers persistence, timing, concurrent dispatch, literal input, receiver verification and auto-pause, session-end cleanup, goal delivery, the management API, uncertain effects, and process-tree termination.
 
 MIT licensed. Croner's license is included in `dist/CRONER-LICENSE`.
