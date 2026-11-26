@@ -25,8 +25,11 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const emptyInput = left => /^\s*[❯›>]\s*$/.test(left);
 const ready = ({ left, right, busy }) => busy ? { ok: false, reason: 'agent is working' }
   : !emptyInput(left) || right.trim() ? { ok: false, reason: 'input line holds unsubmitted text' } : { ok: true };
-// Claude Code and Codex both show this while a turn runs; agent-hook lifecycle records can go stale.
+// Claude Code and Codex both show this while a turn runs (Codex just above the input line, Claude below
+// it); agent-hook lifecycle records can go stale. Only rows near the input line count, so the phrase
+// quoted in conversation output does not.
 const working = text => /esc to interrupt/i.test(text);
+const STATUS_ROWS_ABOVE = 3;
 const wide = cp => (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe4f) || (cp >= 0xff00 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1faff) || cp >= 0x20000;
 // Enter is confirmed when the input line returns to empty within a bounded window.
 async function confirmCleared(read) {
@@ -40,9 +43,18 @@ async function confirmCleared(read) {
 // Minimal SGR tracking for `capture-pane -e`: split a line at a cell column and keep only non-faint text right of it.
 function splitStyled(line, cells) {
   let left = '', right = '', used = 0, faint = false;
-  for (const part of line.split(/(\x1b\[[0-9;]*m)/)) {
-    const sgr = part.match(/^\x1b\[([0-9;]*)m$/);
-    if (sgr) { for (const code of (sgr[1] || '0').split(';').map(Number)) { if (code === 2) faint = true; else if (code === 0 || code === 22) faint = false; } continue; }
+  for (const part of line.split(/(\x1b\[[0-9;:]*m)/)) {
+    const sgr = part.match(/^\x1b\[([0-9;:]*)m$/);
+    if (sgr) {
+      const codes = (sgr[1] || '0').split(';');
+      for (let i = 0; i < codes.length; i++) {
+        const code = Number(codes[i].split(':')[0]);
+        // Extended colors carry their own parameters (38;5;n or 38;2;r;g;b); a colon form is one parameter.
+        if ([38, 48, 58].includes(code) && !codes[i].includes(':')) { i += codes[i + 1] === '5' ? 2 : codes[i + 1] === '2' ? 4 : 0; continue; }
+        if (code === 2) faint = true; else if (code === 0 || code === 22) faint = false;
+      }
+      continue;
+    }
     for (const ch of part) {
       if (used < cells) left += ch; else if (!faint) right += ch;
       used += wide(ch.codePointAt(0)) ? 2 : 1;
@@ -81,7 +93,7 @@ export const terminals = {
       return {
         left: row.filter(span => span.column < grid.cursor.column).map(span => span.text).join(''),
         right: row.filter(span => span.column >= grid.cursor.column && !faint.has(span.style_id)).map(span => span.text).join(''),
-        busy: working((grid.row_spans ?? []).map(span => span.text).join('')),
+        busy: working((grid.row_spans ?? []).filter(span => span.row >= grid.cursor.row - STATUS_ROWS_ABOVE).map(span => span.text).join(' ')),
       };
     },
     async ready(call, t) { return ready(await this.input(call, t)); },
@@ -175,7 +187,7 @@ export const terminals = {
       // In copy mode typed keys become copy-mode commands.
       if (mode) return { left: '', right: '', busy: true };
       const screen = (await call(['tmux', '-S', t.socket, 'capture-pane', '-p', '-e', '-t', t.pane])).output.split('\n');
-      return { ...splitStyled(screen[y] ?? '', x), busy: working(screen.join('\n').replace(/\x1b\[[0-9;]*m/g, '')) };
+      return { ...splitStyled(screen[y] ?? '', x), busy: working(screen.slice(Math.max(0, y - STATUS_ROWS_ABOVE)).join('\n').replace(/\x1b\[[0-9;:]*m/g, '')) };
     },
     async ready(call, t) { return ready(await this.input(call, t)); },
     async submit(call, t, prompt) {

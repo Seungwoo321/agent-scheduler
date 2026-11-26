@@ -838,6 +838,7 @@ var sleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
 var emptyInput = (left) => /^\s*[❯›>]\s*$/.test(left);
 var ready = ({ left, right, busy }) => busy ? { ok: false, reason: "agent is working" } : !emptyInput(left) || right.trim() ? { ok: false, reason: "input line holds unsubmitted text" } : { ok: true };
 var working = (text2) => /esc to interrupt/i.test(text2);
+var STATUS_ROWS_ABOVE = 3;
 var wide = (cp) => cp >= 4352 && cp <= 4447 || cp >= 11904 && cp <= 42191 || cp >= 44032 && cp <= 55203 || cp >= 63744 && cp <= 64255 || cp >= 65072 && cp <= 65103 || cp >= 65280 && cp <= 65376 || cp >= 65504 && cp <= 65510 || cp >= 127744 && cp <= 129791 || cp >= 131072;
 async function confirmCleared(read) {
   for (let i3 = 0; i3 < 20; i3++) {
@@ -849,10 +850,16 @@ async function confirmCleared(read) {
 }
 function splitStyled(line, cells) {
   let left = "", right = "", used = 0, faint = false;
-  for (const part of line.split(/(\x1b\[[0-9;]*m)/)) {
-    const sgr = part.match(/^\x1b\[([0-9;]*)m$/);
+  for (const part of line.split(/(\x1b\[[0-9;:]*m)/)) {
+    const sgr = part.match(/^\x1b\[([0-9;:]*)m$/);
     if (sgr) {
-      for (const code of (sgr[1] || "0").split(";").map(Number)) {
+      const codes = (sgr[1] || "0").split(";");
+      for (let i3 = 0; i3 < codes.length; i3++) {
+        const code = Number(codes[i3].split(":")[0]);
+        if ([38, 48, 58].includes(code) && !codes[i3].includes(":")) {
+          i3 += codes[i3 + 1] === "5" ? 2 : codes[i3 + 1] === "2" ? 4 : 0;
+          continue;
+        }
         if (code === 2) faint = true;
         else if (code === 0 || code === 22) faint = false;
       }
@@ -894,7 +901,7 @@ var terminals = {
       return {
         left: row.filter((span) => span.column < grid.cursor.column).map((span) => span.text).join(""),
         right: row.filter((span) => span.column >= grid.cursor.column && !faint.has(span.style_id)).map((span) => span.text).join(""),
-        busy: working((grid.row_spans ?? []).map((span) => span.text).join(""))
+        busy: working((grid.row_spans ?? []).filter((span) => span.row >= grid.cursor.row - STATUS_ROWS_ABOVE).map((span) => span.text).join(" "))
       };
     },
     async ready(call, t) {
@@ -996,7 +1003,7 @@ var terminals = {
       if (!Number.isInteger(x2) || !Number.isInteger(y2)) throw new Error("tmux cursor unavailable");
       if (mode) return { left: "", right: "", busy: true };
       const screen = (await call(["tmux", "-S", t.socket, "capture-pane", "-p", "-e", "-t", t.pane])).output.split("\n");
-      return { ...splitStyled(screen[y2] ?? "", x2), busy: working(screen.join("\n").replace(/\x1b\[[0-9;]*m/g, "")) };
+      return { ...splitStyled(screen[y2] ?? "", x2), busy: working(screen.slice(Math.max(0, y2 - STATUS_ROWS_ABOVE)).join("\n").replace(/\x1b\[[0-9;:]*m/g, "")) };
     },
     async ready(call, t) {
       return ready(await this.input(call, t));

@@ -142,9 +142,9 @@ test('AC-3 recovery mutex prevents parallel stale-owner unlocks', async t => {
 // A terminal model: an agent input line with a prompt glyph, typed text left of the cursor, an optional
 // draft right of the cursor, a faint ghost suggestion, a working indicator, and Enter that submits
 // (clears the line) unless the agent leaves pasted text in place.
-function fakeTerminal({ draft = '', after = '', busy = false, enterSubmits = true, copyMode = false, orcaStages = ['input_accepted', 'turn_started'], pid = 4242, start = 'Thu Nov 26 10:00:00 2026' } = {}) {
+function fakeTerminal({ glyph, draft = '', after = '', busy = false, enterSubmits = true, copyMode = false, orcaStages = ['input_accepted', 'turn_started'], pid = 4242, start = 'Thu Nov 26 10:00:00 2026' } = {}) {
   const uuid = '12345678-1234-1234-1234-123456789abc';
-  const term = { draft, after, busy, enterSubmits, pid, start, typed: [], calls: [] };
+  const term = { draft, after, busy, enterSubmits, pid, start, glyph, typed: [], calls: [] };
   const width = text => [...text].reduce((n, ch) => n + (ch.codePointAt(0) >= 0x1100 ? 2 : 1), 0);
   term.execute = async argv => {
     term.calls.push(argv);
@@ -155,16 +155,17 @@ function fakeTerminal({ draft = '', after = '', busy = false, enterSubmits = tru
     if (bin === 'cmux' && a1 === 'sessions') return ok(JSON.stringify({ sessions: [{ surface_id: uuid, session_id: 's', pid: term.pid, stored_pid_exists: true, agent_lifecycle: 'running' }] }));
     if (bin === 'cmux' && a1 === 'rpc' && a2 === 'terminal.replay') {
       const col = 2 + width(term.draft);
-      return ok(JSON.stringify({ render_grid: { cursor: { row: 3, column: col }, styles: [{ id: 0, faint: false }, { id: 9, faint: true }], row_spans: [
-        { row: 1, column: 0, text: status, style_id: 0 },
-        { row: 3, column: 0, text: '❯\u00a0', style_id: 0 }, { row: 3, column: 2, text: term.draft, style_id: 0 },
-        { row: 3, column: col, text: term.after, style_id: 0 }, { row: 3, column: col + width(term.after) + 1, text: 'ghost suggestion', style_id: 9 },
+      return ok(JSON.stringify({ render_grid: { cursor: { row: 8, column: col }, styles: [{ id: 0, faint: false }, { id: 9, faint: true }], row_spans: [
+        { row: 0, column: 0, text: 'quoted earlier: esc to interrupt', style_id: 0 },
+        { row: 6, column: 0, text: status, style_id: 0 },
+        { row: 8, column: 0, text: '❯\u00a0', style_id: 0 }, { row: 8, column: 2, text: term.draft, style_id: 0 },
+        { row: 8, column: col, text: term.after, style_id: 0 }, { row: 8, column: col + width(term.after) + 1, text: 'ghost suggestion', style_id: 9 },
       ] } }));
     }
     if (bin === 'cmux' && a1 === 'rpc' && a2 === 'surface.send_text') { const text = JSON.parse(argv[3]).text; term.typed.push(text); term.draft += text; return ok('{}'); }
     if ((bin === 'cmux' && a1 === 'send-key') || (bin === 'tmux' && argv.at(-1) === 'Enter' && !argv.includes('-l'))) { if (term.enterSubmits) { term.draft = ''; term.after = ''; } return ok(''); }
-    if (bin === 'tmux' && argv.includes('display-message')) return ok(argv.at(-1).includes('cursor_x') ? `${2 + width(term.draft)}\t2\t${copyMode ? 1 : 0}` : '%3\tclaude');
-    if (bin === 'tmux' && argv.includes('capture-pane')) return ok(`${status}\n\n❯ ${term.draft}${term.after} \x1b[2mghost suggestion\x1b[0m\n`);
+    if (bin === 'tmux' && argv.includes('display-message')) return ok(argv.at(-1).includes('cursor_x') ? `${2 + width(term.draft)}\t5\t${copyMode ? 1 : 0}` : '%3\tclaude');
+    if (bin === 'tmux' && argv.includes('capture-pane')) return ok(`said: press esc to interrupt\n\n\n${status}\n\n${term.glyph ?? '❯'} ${term.draft}${term.after} \x1b[2mghost suggestion\x1b[0m\n`);
     if (bin === 'tmux' && argv.includes('-l')) { term.typed.push(argv.at(-1)); term.draft += argv.at(-1); return ok(''); }
     if (bin === 'orca' && a2 === 'show') return ok('{"ok":true,"result":{"terminal":{"agentIdentity":"codex"}}}');
     if (bin === 'orca' && a2 === 'wait') return term.busy ? { code: 1, output: '{"ok":false,"error":{"message":"timeout"}}' } : ok('{"ok":true}');
@@ -201,6 +202,9 @@ test('AC-2 a draft or a busy agent is never typed over; the occurrence is skippe
     [{ type: 'cmux', surface: uuid, workspace: uuid, prompt: 'check' }, { after: '커서 뒤 초안' }],
     [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { draft: '쓰던 글' }],
     [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { after: 'draft after cursor' }],
+    [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { glyph: '\x1b[38;2;153;153;153m❯\x1b[39m', after: 'truecolor glyph draft' }],
+    [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { glyph: '\x1b[38;5;2m❯\x1b[39m', after: '256-color glyph draft' }],
+    [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { glyph: '\x1b[48:2::30:30:30m❯', after: 'colon form draft' }],
     [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { busy: true }],
     [{ type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' }, { copyMode: true }],
     [{ type: 'orca', terminal: 'term_1', prompt: 'check' }, { busy: true }],
