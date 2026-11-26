@@ -838,7 +838,19 @@ var sleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
 var emptyInput = (left) => /^\s*[❯›>]\s*$/.test(left);
 var ready = ({ left, right, busy }) => busy ? { ok: false, reason: "agent is working" } : !emptyInput(left) || right.trim() ? { ok: false, reason: "input line holds unsubmitted text" } : { ok: true };
 var working = (text2) => /esc to interrupt/i.test(text2);
-var STATUS_ROWS_ABOVE = 3;
+var STATUS_ROWS_ABOVE = 6;
+var rowsText = (spans, fromRow) => {
+  const rows = /* @__PURE__ */ new Map();
+  for (const span of spans) if (span.row >= fromRow) (rows.get(span.row) ?? rows.set(span.row, []).get(span.row)).push(span);
+  return [...rows.entries()].sort((a, b2) => a[0] - b2[0]).map(([, row]) => {
+    let text2 = "", end = 0;
+    for (const span of row.sort((a, b2) => a.column - b2.column)) {
+      text2 += " ".repeat(Math.max(0, span.column - end)) + span.text;
+      end = span.column + (span.cell_width ?? [...span.text].length);
+    }
+    return text2;
+  }).join("\n");
+};
 var wide = (cp) => cp >= 4352 && cp <= 4447 || cp >= 11904 && cp <= 42191 || cp >= 44032 && cp <= 55203 || cp >= 63744 && cp <= 64255 || cp >= 65072 && cp <= 65103 || cp >= 65280 && cp <= 65376 || cp >= 65504 && cp <= 65510 || cp >= 127744 && cp <= 129791 || cp >= 131072;
 async function confirmCleared(read) {
   for (let i3 = 0; i3 < 20; i3++) {
@@ -901,7 +913,7 @@ var terminals = {
       return {
         left: row.filter((span) => span.column < grid.cursor.column).map((span) => span.text).join(""),
         right: row.filter((span) => span.column >= grid.cursor.column && !faint.has(span.style_id)).map((span) => span.text).join(""),
-        busy: working((grid.row_spans ?? []).filter((span) => span.row >= grid.cursor.row - STATUS_ROWS_ABOVE).map((span) => span.text).join(" "))
+        busy: working(rowsText(grid.row_spans ?? [], grid.cursor.row - STATUS_ROWS_ABOVE))
       };
     },
     async ready(call, t) {

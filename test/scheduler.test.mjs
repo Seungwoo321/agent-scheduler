@@ -155,17 +155,18 @@ function fakeTerminal({ glyph, draft = '', after = '', busy = false, enterSubmit
     if (bin === 'cmux' && a1 === 'sessions') return ok(JSON.stringify({ sessions: [{ surface_id: uuid, session_id: 's', pid: term.pid, stored_pid_exists: true, agent_lifecycle: 'running' }] }));
     if (bin === 'cmux' && a1 === 'rpc' && a2 === 'terminal.replay') {
       const col = 2 + width(term.draft);
-      return ok(JSON.stringify({ render_grid: { cursor: { row: 8, column: col }, styles: [{ id: 0, faint: false }, { id: 9, faint: true }], row_spans: [
+      return ok(JSON.stringify({ render_grid: { cursor: { row: 10, column: col }, styles: [{ id: 0, faint: false }, { id: 9, faint: true }], row_spans: [
         { row: 0, column: 0, text: 'quoted earlier: esc to interrupt', style_id: 0 },
-        { row: 6, column: 0, text: status, style_id: 0 },
-        { row: 8, column: 0, text: '❯\u00a0', style_id: 0 }, { row: 8, column: 2, text: term.draft, style_id: 0 },
-        { row: 8, column: col, text: term.after, style_id: 0 }, { row: 8, column: col + width(term.after) + 1, text: 'ghost suggestion', style_id: 9 },
+        // Codex-style status: the key hint is styled separately from the rest of the phrase.
+        ...(term.busy ? [{ row: 6, column: 0, text: '• Working (5s • ', style_id: 0, cell_width: 16 }, { row: 6, column: 16, text: 'esc', style_id: 9, cell_width: 3 }, { row: 6, column: 19, text: ' to interrupt)', style_id: 0, cell_width: 14 }] : []),
+        { row: 10, column: 0, text: '❯\u00a0', style_id: 0 }, { row: 10, column: 2, text: term.draft, style_id: 0 },
+        { row: 10, column: col, text: term.after, style_id: 0 }, { row: 10, column: col + width(term.after) + 1, text: 'ghost suggestion', style_id: 9 },
       ] } }));
     }
     if (bin === 'cmux' && a1 === 'rpc' && a2 === 'surface.send_text') { const text = JSON.parse(argv[3]).text; term.typed.push(text); term.draft += text; return ok('{}'); }
     if ((bin === 'cmux' && a1 === 'send-key') || (bin === 'tmux' && argv.at(-1) === 'Enter' && !argv.includes('-l'))) { if (term.enterSubmits) { term.draft = ''; term.after = ''; } return ok(''); }
-    if (bin === 'tmux' && argv.includes('display-message')) return ok(argv.at(-1).includes('cursor_x') ? `${2 + width(term.draft)}\t5\t${copyMode ? 1 : 0}` : '%3\tclaude');
-    if (bin === 'tmux' && argv.includes('capture-pane')) return ok(`said: press esc to interrupt\n\n\n${status}\n\n${term.glyph ?? '❯'} ${term.draft}${term.after} \x1b[2mghost suggestion\x1b[0m\n`);
+    if (bin === 'tmux' && argv.includes('display-message')) return ok(argv.at(-1).includes('cursor_x') ? `${2 + width(term.draft)}\t10\t${copyMode ? 1 : 0}` : '%3\tclaude');
+    if (bin === 'tmux' && argv.includes('capture-pane')) return ok(`said: press esc to interrupt${'\n'.repeat(8)}${status}\n\n${term.glyph ?? '❯'} ${term.draft}${term.after} \x1b[2mghost suggestion\x1b[0m\n`);
     if (bin === 'tmux' && argv.includes('-l')) { term.typed.push(argv.at(-1)); term.draft += argv.at(-1); return ok(''); }
     if (bin === 'orca' && a2 === 'show') return ok('{"ok":true,"result":{"terminal":{"agentIdentity":"codex"}}}');
     if (bin === 'orca' && a2 === 'wait') return term.busy ? { code: 1, output: '{"ok":false,"error":{"message":"timeout"}}' } : ok('{"ok":true}');

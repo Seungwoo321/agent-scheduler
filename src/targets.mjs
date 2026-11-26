@@ -25,11 +25,21 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const emptyInput = left => /^\s*[❯›>]\s*$/.test(left);
 const ready = ({ left, right, busy }) => busy ? { ok: false, reason: 'agent is working' }
   : !emptyInput(left) || right.trim() ? { ok: false, reason: 'input line holds unsubmitted text' } : { ok: true };
-// Claude Code and Codex both show this while a turn runs (Codex just above the input line, Claude below
-// it); agent-hook lifecycle records can go stale. Only rows near the input line count, so the phrase
-// quoted in conversation output does not.
+// Claude Code and Codex both show this while a turn runs (Codex above the input line, Claude below it);
+// agent-hook lifecycle records can go stale. Only rows from six above the input line downward count,
+// so the phrase quoted further up in conversation output does not.
 const working = text => /esc to interrupt/i.test(text);
-const STATUS_ROWS_ABOVE = 3;
+const STATUS_ROWS_ABOVE = 6;
+// Rebuild row text from styled spans by cell column; spans split wherever the style changes.
+const rowsText = (spans, fromRow) => {
+  const rows = new Map();
+  for (const span of spans) if (span.row >= fromRow) (rows.get(span.row) ?? rows.set(span.row, []).get(span.row)).push(span);
+  return [...rows.entries()].sort((a, b) => a[0] - b[0]).map(([, row]) => {
+    let text = '', end = 0;
+    for (const span of row.sort((a, b) => a.column - b.column)) { text += ' '.repeat(Math.max(0, span.column - end)) + span.text; end = span.column + (span.cell_width ?? [...span.text].length); }
+    return text;
+  }).join('\n');
+};
 const wide = cp => (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe4f) || (cp >= 0xff00 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1faff) || cp >= 0x20000;
 // Enter is confirmed when the input line returns to empty within a bounded window.
 async function confirmCleared(read) {
@@ -93,7 +103,7 @@ export const terminals = {
       return {
         left: row.filter(span => span.column < grid.cursor.column).map(span => span.text).join(''),
         right: row.filter(span => span.column >= grid.cursor.column && !faint.has(span.style_id)).map(span => span.text).join(''),
-        busy: working((grid.row_spans ?? []).filter(span => span.row >= grid.cursor.row - STATUS_ROWS_ABOVE).map(span => span.text).join(' ')),
+        busy: working(rowsText(grid.row_spans ?? [], grid.cursor.row - STATUS_ROWS_ABOVE)),
       };
     },
     async ready(call, t) { return ready(await this.input(call, t)); },
