@@ -174,6 +174,33 @@ test('AC-2 an ended receiver session is not typed into and its schedule is pause
   assert.equal(saved.enabled, false); assert.equal(state.pending, undefined);
 });
 
+test('AC-2 a failed receiver check that is not absence keeps the schedule enabled', async t => {
+  const store = await fixture(t);
+  await store.put({ ...spec(), target: { type: 'tmux', socket: '/tmp/tmux-test', pane: '%3', prompt: 'check' } });
+  const execute = (target, options) => dispatch(target, { ...options, execute: async () => ({ code: null, output: '', timedOut: false, aborted: true }) });
+  const [run] = await store.tick({ execute });
+  assert.equal(run.status, 'not-delivered'); assert.equal(run.receiverGone, false);
+  const [{ spec: saved, state }] = await store.list();
+  assert.equal(saved.enabled, true); assert.equal(state.pending, undefined);
+});
+
+test('AC-2 a cmux schedule bound to an agent session pauses when another session replaced it', async t => {
+  const store = await fixture(t), uuid = '12345678-1234-1234-1234-123456789abc';
+  await store.put({ ...spec(), target: { type: 'cmux', workspace: uuid, surface: uuid, session: 'old-session', prompt: 'check' } });
+  const calls = [];
+  const execute = (target, options) => dispatch(target, { ...options, execute: async argv => { calls.push(argv); return { code: 0, output: argv[1] === 'sessions' ? JSON.stringify({ sessions: [{ surface_id: uuid, session_id: 'new-session', stored_pid_exists: true }] }) : uuid }; } });
+  const [run] = await store.tick({ execute });
+  assert.equal(run.receiverGone, true); assert.equal(calls.length, 2);
+  assert.equal((await store.list())[0].spec.enabled, false);
+});
+
+test('AC-1 editing a one-shot that already ran does not dispatch it again', async t => {
+  const store = await fixture(t); await store.put(spec());
+  assert.equal((await store.tick()).length, 1);
+  await store.put({ ...spec(), maxRuns: 5 });
+  assert.deepEqual(await store.tick(), []);
+});
+
 test('AC-3 session end removes schedules addressed to that terminal only', async t => {
   const store = await fixture(t), uuid = '12345678-1234-1234-1234-123456789abc', other = '12345678-1234-1234-1234-123456789abd';
   await store.put({ ...spec('mine'), target: { type: 'cmux', workspace: uuid, surface: uuid, prompt: 'check' } });
@@ -182,6 +209,19 @@ test('AC-3 session end removes schedules addressed to that terminal only', async
   const receivers = await currentReceivers({ CMUX_WORKSPACE_ID: uuid.toUpperCase(), CMUX_SURFACE_ID: uuid.toUpperCase() });
   assert.deepEqual(await store.removeForReceivers(receivers), [{ id: 'mine', removed: true }]);
   assert.deepEqual((await store.list()).map(e => e.spec.id), ['command', 'theirs']);
+  // A child agent process in the same terminal does not end a schedule bound to the receiving session.
+  await store.put({ ...spec('bound'), target: { type: 'cmux', workspace: uuid, surface: uuid, session: 'receiver', prompt: 'check' } });
+  assert.deepEqual(await store.removeForReceivers(receivers, 'child'), []);
+  assert.deepEqual(await store.removeForReceivers(receivers, 'receiver'), [{ id: 'bound', removed: true }]);
+});
+
+test('AC-3 session-end hook keeps schedules on /clear and /resume', async t => {
+  const store = await fixture(t), uuid = '12345678-1234-1234-1234-123456789abc';
+  await store.put({ ...spec('mine'), target: { type: 'cmux', workspace: uuid, surface: uuid, prompt: 'check' } });
+  const run = reason => spawnSync(process.execPath, [new URL('../src/cli.mjs', import.meta.url).pathname, '--store', store.root, 'session-end'], { input: JSON.stringify({ session_id: 's', reason }), encoding: 'utf8', env: { ...process.env, CMUX_WORKSPACE_ID: uuid, CMUX_SURFACE_ID: uuid, TMUX: '', TMUX_PANE: '', ORCA_PANE_KEY: '' } });
+  for (const reason of ['clear', 'resume']) assert.equal(JSON.parse(run(reason).stdout).skipped, reason);
+  assert.equal((await store.list()).length, 1);
+  assert.deepEqual(JSON.parse(run('prompt_input_exit').stdout).schedules, [{ id: 'mine', removed: true }]);
 });
 
 test('AC-2 partial terminal submission failure does not try another transport', async () => {

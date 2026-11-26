@@ -40,8 +40,16 @@ try {
   else if (command === 'status') print(await status(store));
   else if (command === 'terminals') print(await listTerminals());
   else if (command === 'session-end') {
-    const receivers = await currentReceivers();
-    print({ receivers, schedules: receivers.length ? await store.removeForReceivers(receivers) : [] });
+    // Hook input carries the ending agent session and its reason; /clear and /resume keep the agent running.
+    let input = '';
+    if (!process.stdin.isTTY) for await (const chunk of process.stdin) input += chunk;
+    let hook = {};
+    try { hook = input.trim() ? JSON.parse(input) : {}; } catch { hook = {}; }
+    if (['clear', 'resume'].includes(hook.reason)) print({ skipped: hook.reason });
+    else {
+      const receivers = await currentReceivers();
+      print({ receivers, session: hook.session_id ?? null, schedules: receivers.length ? await store.removeForReceivers(receivers, hook.session_id) : [] });
+    }
   } else if (command === 'ui') {
     const { server, token } = createUi(store);
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(Number(port ?? 0), '127.0.0.1', resolve); });

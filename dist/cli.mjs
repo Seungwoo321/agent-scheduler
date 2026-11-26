@@ -819,6 +819,7 @@ var absolute = (v2, name) => {
   if (!isAbsolute(v2)) throw new Error(`${name} must be absolute`);
 };
 var shell = /^-?(sh|bash|zsh|fish|dash|ksh|tcsh|csh|nu|pwsh)$/;
+var gone = (message) => Object.assign(new Error(message), { receiverGone: true });
 var json = (output) => {
   try {
     return JSON.parse(output);
@@ -835,9 +836,11 @@ var terminals = {
     key: (t) => [t.workspace, t.surface],
     async verify(call, t) {
       const listed = await call(["cmux", "--id-format", "uuids", "tree", "--workspace", t.workspace]);
-      if (!listed.output.toLowerCase().includes(t.surface.toLowerCase())) throw new Error("cmux surface is absent from the declared workspace");
+      if (!listed.output.toLowerCase().includes(t.surface.toLowerCase())) throw gone("cmux surface is absent from the declared workspace");
       const sessions = json((await call(["cmux", "sessions", "list", "--surface", t.surface, "--json", "--all"])).output)?.sessions ?? [];
-      if (!sessions.some((r) => r.surface_id?.toLowerCase() === t.surface.toLowerCase() && r.stored_pid_exists === true)) throw new Error("No live agent session on the cmux surface");
+      const live = sessions.filter((r) => r.surface_id?.toLowerCase() === t.surface.toLowerCase() && r.stored_pid_exists === true);
+      if (!live.length) throw gone("No live agent session on the cmux surface");
+      if (t.session && !live.some((r) => r.session_id?.toLowerCase() === t.session.toLowerCase())) throw gone("The registered agent session no longer runs on the cmux surface");
     },
     async submit(call, t, prompt) {
       await call(["cmux", "rpc", "surface.send_text", JSON.stringify({ workspace_id: t.workspace, surface_id: t.surface, text: prompt })]);
@@ -855,7 +858,7 @@ var terminals = {
       for (const w2 of tree?.windows ?? []) for (const ws of w2.workspaces ?? []) for (const pane of ws.panes ?? []) for (const s of pane.surfaces ?? []) {
         if (s.type !== "terminal") continue;
         const session = sessions.filter((r) => r.surface_id?.toLowerCase() === s.id.toLowerCase() && r.stored_pid_exists === true).sort((a, b2) => (b2.updated_at_unix ?? 0) - (a.updated_at_unix ?? 0))[0];
-        rows.push({ target: { type: "cmux", workspace: ws.id, surface: s.id }, label: s.title ?? s.id, group: ws.title ?? ws.id, live: !!session, agent: session?.agent ?? null, session: session?.session_id ?? null, cwd: session?.cwd ?? null });
+        rows.push({ target: { type: "cmux", workspace: ws.id, surface: s.id, ...session ? { session: session.session_id } : {} }, label: s.title ?? s.id, group: ws.title ?? ws.id, live: !!session, agent: session?.agent ?? null, session: session?.session_id ?? null, cwd: session?.cwd ?? null });
       }
       return rows;
     }
@@ -868,10 +871,12 @@ var terminals = {
     },
     key: (t) => [t.terminal],
     async verify(call, t) {
-      const shown = json((await call(["orca", "terminal", "show", "--terminal", t.terminal, "--json"])).output);
-      if (shown?.ok === false) throw new Error(`orca terminal unavailable (${shown.error?.code ?? "unknown"})`);
+      const result = await call(["orca", "terminal", "show", "--terminal", t.terminal, "--json"]).catch((error) => error);
+      const shown = json(result.output ?? "");
+      if (shown?.ok === false && /stale|not_found|unknown_terminal/.test(shown.error?.code ?? "")) throw gone(`orca terminal is gone (${shown.error.code})`);
+      if (result instanceof Error) throw result;
       const terminal = shown?.result?.terminal ?? shown?.result ?? shown;
-      if (!terminal?.agentIdentity) throw new Error("No running agent in the orca terminal");
+      if (!terminal?.agentIdentity) throw gone("No running agent in the orca terminal");
     },
     async submit(call, t, prompt) {
       const sent = json((await call(["orca", "terminal", "send", "--terminal", t.terminal, "--text", prompt, "--enter", "--json"])).output);
@@ -904,10 +909,11 @@ var terminals = {
     },
     key: (t) => [t.socket, t.pane],
     async verify(call, t) {
-      const listed = await call(["tmux", "-S", t.socket, "display-message", "-p", "-t", t.pane, "#{pane_id}	#{pane_current_command}"]);
+      const listed = await call(["tmux", "-S", t.socket, "display-message", "-p", "-t", t.pane, "#{pane_id}	#{pane_current_command}"]).catch((error) => error);
+      if (listed instanceof Error) throw /can't find pane|no server running|error connecting/i.test(listed.message) ? gone(listed.message) : listed;
       const [pane, command2] = listed.output.trim().split("	");
-      if (pane !== t.pane) throw new Error("tmux pane identity mismatch");
-      if (shell.test(command2 ?? "")) throw new Error("No running agent in the tmux pane");
+      if (pane !== t.pane) throw gone("tmux pane identity mismatch");
+      if (shell.test(command2 ?? "")) throw gone("No running agent in the tmux pane");
     },
     async submit(call, t, prompt) {
       await call(["tmux", "-S", t.socket, "send-keys", "-t", t.pane, "-l", "--", prompt]);
@@ -931,7 +937,7 @@ function validateTarget(target) {
   if (!target || typeof target !== "object" || Array.isArray(target)) throw new Error("target must be an object");
   if (target.type === "codex-queue") throw new Error("codex-queue was removed; target the agent through its terminal (cmux, orca, or tmux)");
   const manager = terminals[target.type];
-  const allowed = target.type === "command" ? ["type", "argv", "cwd"] : manager && ["type", ...manager.fields, "mode", "prompt"];
+  const allowed = target.type === "command" ? ["type", "argv", "cwd"] : manager && ["type", ...manager.fields, "session", "mode", "prompt"];
   if (!allowed || Object.keys(target).some((k2) => !allowed.includes(k2))) throw new Error("Unknown target type or field");
   if (target.type === "command") {
     if (!Array.isArray(target.argv) || !target.argv.length) throw new Error("command.argv must be nonempty");
@@ -943,6 +949,7 @@ function validateTarget(target) {
   if (target.prompt.includes("	")) throw new Error("Tab control input is not allowed in prompts");
   if (target.prompt.length > 16e3) throw new Error("prompt exceeds 16000 characters");
   if (target.mode !== void 0 && !["prompt", "goal"].includes(target.mode)) throw new Error("mode must be prompt or goal");
+  if (target.session !== void 0 && (typeof target.session !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(target.session))) throw new Error("Invalid agent session id");
   manager.validate(target);
   return target;
 }
@@ -1008,7 +1015,7 @@ var caller = (options = {}) => {
     const result = await execute(argv, { ...options, ...extra });
     if (result.code !== 0 || result.timedOut || result.aborted) {
       const detail = json(result.output ?? "")?.error?.message ?? result.output?.trim().split("\n").at(-1);
-      throw new Error(`Transport failed (${result.timedOut ? "timeout" : result.aborted ? "aborted" : result.code})${detail ? `: ${detail.slice(0, 300)}` : ""}`);
+      throw Object.assign(new Error(`Transport failed (${result.timedOut ? "timeout" : result.aborted ? "aborted" : result.code})${detail ? `: ${detail.slice(0, 300)}` : ""}`), { output: result.output });
     }
     return result;
   };
@@ -1024,7 +1031,7 @@ async function dispatch(target, options = {}) {
   try {
     await manager.verify(call, target);
   } catch (error) {
-    return { status: "not-delivered", acknowledgment: "receiver-check-failed-before-input", error: error.message };
+    return { status: "not-delivered", acknowledgment: "receiver-check-failed-before-input", receiverGone: !!error.receiverGone, error: error.message };
   }
   const prompt = target.prompt.replace(/[\r\n]+/g, " ");
   await manager.submit(call, target, target.mode === "goal" ? `/goal ${prompt}` : prompt);
@@ -1181,7 +1188,8 @@ var Store = class {
       const previous = await this.read(this.path("state", spec.id));
       if (previous?.pending) throw new Error("Resolve the pending run before replacing this schedule");
       await this.atomic(this.path("schedules", spec.id), spec);
-      const state = { ...previous, runs: previous?.runs ?? 0, nextAt: spec.trigger.at ?? nextDue(spec, Date.now()) };
+      const spent = spec.trigger.at && previous?.lastAt && Date.parse(spec.trigger.at) <= Date.parse(previous.lastAt);
+      const state = { ...previous, runs: previous?.runs ?? 0, nextAt: spent ? null : spec.trigger.at ?? nextDue(spec, Date.now()) };
       await this.atomic(this.path("state", spec.id), state);
       return { spec, state };
     });
@@ -1202,11 +1210,12 @@ var Store = class {
       return { id, removed: true };
     });
   }
-  async removeForReceivers(receivers) {
+  async removeForReceivers(receivers, session) {
     return this.lock("store", async () => {
       const result = [];
       for (const { spec, state } of await this.list()) {
         if (!receivers.some((r) => sameReceiver(spec.target, r))) continue;
+        if (spec.target.session && spec.target.session.toLowerCase() !== session?.toLowerCase()) continue;
         if (state?.pending) {
           await this.atomic(this.path("schedules", spec.id), { ...spec, enabled: false });
           result.push({ id: spec.id, paused: true, pending: state.pending });
@@ -1266,7 +1275,7 @@ var Store = class {
       await this.lock("store", async () => {
         await this.atomic(this.path("runs", receipt.runId), { ...receipt, ...result, finishedAt: iso(Date.now()) });
         const state = await this.read(this.path("state", spec.id));
-        const current = result.status === "not-delivered" && await this.read(this.path("schedules", spec.id));
+        const current = result.receiverGone && await this.read(this.path("schedules", spec.id));
         if (current?.enabled) await this.atomic(this.path("schedules", spec.id), { ...current, enabled: false });
         if (state?.pending === receipt.runId && result.status !== "uncertain") {
           delete state.pending;
@@ -1504,7 +1513,7 @@ async function refresh() {
     }
   } catch (error) { fail(error); }
 }
-const receiverKey = ({ prompt, mode, ...rest }) => JSON.stringify(rest).toLowerCase();
+const receiverKey = ({ prompt, mode, session, ...rest }) => JSON.stringify(rest).toLowerCase();
 async function remember(promise) {
   const groups = await promise;
   receivers = new Map(groups.flatMap(g => g.terminals.map(x => [receiverKey(x.target), x])));
@@ -1717,8 +1726,19 @@ No API key or model process is required.`);
   else if (command === "status") print(await status(store));
   else if (command === "terminals") print(await listTerminals());
   else if (command === "session-end") {
-    const receivers = await currentReceivers();
-    print({ receivers, schedules: receivers.length ? await store.removeForReceivers(receivers) : [] });
+    let input = "";
+    if (!process.stdin.isTTY) for await (const chunk of process.stdin) input += chunk;
+    let hook = {};
+    try {
+      hook = input.trim() ? JSON.parse(input) : {};
+    } catch {
+      hook = {};
+    }
+    if (["clear", "resume"].includes(hook.reason)) print({ skipped: hook.reason });
+    else {
+      const receivers = await currentReceivers();
+      print({ receivers, session: hook.session_id ?? null, schedules: receivers.length ? await store.removeForReceivers(receivers, hook.session_id) : [] });
+    }
   } else if (command === "ui") {
     const { server, token } = createUi(store);
     await new Promise((resolve2, reject) => {

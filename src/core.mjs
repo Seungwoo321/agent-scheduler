@@ -108,7 +108,9 @@ export class Store {
       if (previous?.pending) throw new Error('Resolve the pending run before replacing this schedule');
       await this.atomic(this.path('schedules', spec.id), spec);
       // Replacing a definition keeps its execution budget and history.
-      const state = { ...previous, runs: previous?.runs ?? 0, nextAt: spec.trigger.at ?? nextDue(spec, Date.now()) };
+      // A one-shot that already ran at or after its time is not re-armed by an edit.
+      const spent = spec.trigger.at && previous?.lastAt && Date.parse(spec.trigger.at) <= Date.parse(previous.lastAt);
+      const state = { ...previous, runs: previous?.runs ?? 0, nextAt: spent ? null : spec.trigger.at ?? nextDue(spec, Date.now()) };
       await this.atomic(this.path('state', spec.id), state);
       return { spec, state };
     });
@@ -130,11 +132,13 @@ export class Store {
       return { id, removed: true };
     });
   }
-  async removeForReceivers(receivers) {
+  async removeForReceivers(receivers, session) {
     return this.lock('store', async () => {
       const result = [];
       for (const { spec, state } of await this.list()) {
         if (!receivers.some(r => sameReceiver(spec.target, r))) continue;
+        // A schedule bound to an agent session ends only with that session, not with another process in the terminal.
+        if (spec.target.session && spec.target.session.toLowerCase() !== session?.toLowerCase()) continue;
         // A pending run needs inspection before removal; stop further dispatch meanwhile.
         if (state?.pending) { await this.atomic(this.path('schedules', spec.id), { ...spec, enabled: false }); result.push({ id: spec.id, paused: true, pending: state.pending }); }
         else { await rm(this.path('schedules', spec.id)); result.push({ id: spec.id, removed: true }); }
@@ -190,7 +194,7 @@ export class Store {
         await this.atomic(this.path('runs', receipt.runId), { ...receipt, ...result, finishedAt: iso(Date.now()) });
         const state = await this.read(this.path('state', spec.id));
         // The receiver ended without removing its schedule; pause instead of retrying an absent session.
-        const current = result.status === 'not-delivered' && await this.read(this.path('schedules', spec.id));
+        const current = result.receiverGone && await this.read(this.path('schedules', spec.id));
         if (current?.enabled) await this.atomic(this.path('schedules', spec.id), { ...current, enabled: false });
         if (state?.pending === receipt.runId && result.status !== 'uncertain') {
           delete state.pending;

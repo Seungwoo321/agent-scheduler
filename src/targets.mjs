@@ -8,6 +8,8 @@ const text = (v, name) => {
 };
 const absolute = (v, name) => { text(v, name); if (!isAbsolute(v)) throw new Error(`${name} must be absolute`); };
 const shell = /^-?(sh|bash|zsh|fish|dash|ksh|tcsh|csh|nu|pwsh)$/;
+// Receiver absence pauses a schedule; a failed check (abort, timeout, manager down) does not.
+const gone = message => Object.assign(new Error(message), { receiverGone: true });
 const json = output => { try { return JSON.parse(output); } catch { return null; } };
 
 // Terminal managers differ in addressing and transport; the scheduler contract is the same for every
@@ -19,10 +21,12 @@ export const terminals = {
     key: t => [t.workspace, t.surface],
     async verify(call, t) {
       const listed = await call(['cmux', '--id-format', 'uuids', 'tree', '--workspace', t.workspace]);
-      if (!listed.output.toLowerCase().includes(t.surface.toLowerCase())) throw new Error('cmux surface is absent from the declared workspace');
+      if (!listed.output.toLowerCase().includes(t.surface.toLowerCase())) throw gone('cmux surface is absent from the declared workspace');
       // Agent hooks record every Claude/Codex session per surface; no live record means the session ended.
       const sessions = json((await call(['cmux', 'sessions', 'list', '--surface', t.surface, '--json', '--all'])).output)?.sessions ?? [];
-      if (!sessions.some(r => r.surface_id?.toLowerCase() === t.surface.toLowerCase() && r.stored_pid_exists === true)) throw new Error('No live agent session on the cmux surface');
+      const live = sessions.filter(r => r.surface_id?.toLowerCase() === t.surface.toLowerCase() && r.stored_pid_exists === true);
+      if (!live.length) throw gone('No live agent session on the cmux surface');
+      if (t.session && !live.some(r => r.session_id?.toLowerCase() === t.session.toLowerCase())) throw gone('The registered agent session no longer runs on the cmux surface');
     },
     async submit(call, t, prompt) {
       // The send CLI expands backslash-n/r/t. RPC sends literal text.
@@ -39,7 +43,7 @@ export const terminals = {
       for (const w of tree?.windows ?? []) for (const ws of w.workspaces ?? []) for (const pane of ws.panes ?? []) for (const s of pane.surfaces ?? []) {
         if (s.type !== 'terminal') continue;
         const session = sessions.filter(r => r.surface_id?.toLowerCase() === s.id.toLowerCase() && r.stored_pid_exists === true).sort((a, b) => (b.updated_at_unix ?? 0) - (a.updated_at_unix ?? 0))[0];
-        rows.push({ target: { type: 'cmux', workspace: ws.id, surface: s.id }, label: s.title ?? s.id, group: ws.title ?? ws.id, live: !!session, agent: session?.agent ?? null, session: session?.session_id ?? null, cwd: session?.cwd ?? null });
+        rows.push({ target: { type: 'cmux', workspace: ws.id, surface: s.id, ...(session ? { session: session.session_id } : {}) }, label: s.title ?? s.id, group: ws.title ?? ws.id, live: !!session, agent: session?.agent ?? null, session: session?.session_id ?? null, cwd: session?.cwd ?? null });
       }
       return rows;
     },
@@ -50,10 +54,12 @@ export const terminals = {
     key: t => [t.terminal],
     async verify(call, t) {
       // Handles are runtime-scoped; a stale handle fails here, before any input.
-      const shown = json((await call(['orca', 'terminal', 'show', '--terminal', t.terminal, '--json'])).output);
-      if (shown?.ok === false) throw new Error(`orca terminal unavailable (${shown.error?.code ?? 'unknown'})`);
+      const result = await call(['orca', 'terminal', 'show', '--terminal', t.terminal, '--json']).catch(error => error);
+      const shown = json(result.output ?? '');
+      if (shown?.ok === false && /stale|not_found|unknown_terminal/.test(shown.error?.code ?? '')) throw gone(`orca terminal is gone (${shown.error.code})`);
+      if (result instanceof Error) throw result;
       const terminal = shown?.result?.terminal ?? shown?.result ?? shown;
-      if (!terminal?.agentIdentity) throw new Error('No running agent in the orca terminal');
+      if (!terminal?.agentIdentity) throw gone('No running agent in the orca terminal');
     },
     async submit(call, t, prompt) {
       const sent = json((await call(['orca', 'terminal', 'send', '--terminal', t.terminal, '--text', prompt, '--enter', '--json'])).output);
@@ -84,11 +90,12 @@ export const terminals = {
     validate(t) { if (!/^%\d+$/.test(t.pane)) throw new Error('tmux requires an exact %pane id'); absolute(t.socket, 'tmux socket'); },
     key: t => [t.socket, t.pane],
     async verify(call, t) {
-      const listed = await call(['tmux', '-S', t.socket, 'display-message', '-p', '-t', t.pane, '#{pane_id}\t#{pane_current_command}']);
+      const listed = await call(['tmux', '-S', t.socket, 'display-message', '-p', '-t', t.pane, '#{pane_id}\t#{pane_current_command}']).catch(error => error);
+      if (listed instanceof Error) throw /can't find pane|no server running|error connecting/i.test(listed.message) ? gone(listed.message) : listed;
       const [pane, command] = listed.output.trim().split('\t');
-      if (pane !== t.pane) throw new Error('tmux pane identity mismatch');
+      if (pane !== t.pane) throw gone('tmux pane identity mismatch');
       // A shell in the foreground means the agent exited; typed text would run as a command.
-      if (shell.test(command ?? '')) throw new Error('No running agent in the tmux pane');
+      if (shell.test(command ?? '')) throw gone('No running agent in the tmux pane');
     },
     async submit(call, t, prompt) {
       await call(['tmux', '-S', t.socket, 'send-keys', '-t', t.pane, '-l', '--', prompt]);
@@ -111,7 +118,7 @@ export function validateTarget(target) {
   if (!target || typeof target !== 'object' || Array.isArray(target)) throw new Error('target must be an object');
   if (target.type === 'codex-queue') throw new Error('codex-queue was removed; target the agent through its terminal (cmux, orca, or tmux)');
   const manager = terminals[target.type];
-  const allowed = target.type === 'command' ? ['type', 'argv', 'cwd'] : manager && ['type', ...manager.fields, 'mode', 'prompt'];
+  const allowed = target.type === 'command' ? ['type', 'argv', 'cwd'] : manager && ['type', ...manager.fields, 'session', 'mode', 'prompt'];
   if (!allowed || Object.keys(target).some(k => !allowed.includes(k))) throw new Error('Unknown target type or field');
   if (target.type === 'command') {
     if (!Array.isArray(target.argv) || !target.argv.length) throw new Error('command.argv must be nonempty');
@@ -123,6 +130,7 @@ export function validateTarget(target) {
   if (target.prompt.includes('\t')) throw new Error('Tab control input is not allowed in prompts');
   if (target.prompt.length > 16000) throw new Error('prompt exceeds 16000 characters');
   if (target.mode !== undefined && !['prompt', 'goal'].includes(target.mode)) throw new Error('mode must be prompt or goal');
+  if (target.session !== undefined && (typeof target.session !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(target.session))) throw new Error('Invalid agent session id');
   manager.validate(target);
   return target;
 }
@@ -166,7 +174,7 @@ const caller = (options = {}) => {
     const result = await execute(argv, { ...options, ...extra });
     if (result.code !== 0 || result.timedOut || result.aborted) {
       const detail = json(result.output ?? '')?.error?.message ?? result.output?.trim().split('\n').at(-1);
-      throw new Error(`Transport failed (${result.timedOut ? 'timeout' : result.aborted ? 'aborted' : result.code})${detail ? `: ${detail.slice(0, 300)}` : ''}`);
+      throw Object.assign(new Error(`Transport failed (${result.timedOut ? 'timeout' : result.aborted ? 'aborted' : result.code})${detail ? `: ${detail.slice(0, 300)}` : ''}`), { output: result.output });
     }
     return result;
   };
@@ -181,7 +189,7 @@ export async function dispatch(target, options = {}) {
   }
   const manager = terminals[target.type];
   try { await manager.verify(call, target); }
-  catch (error) { return { status: 'not-delivered', acknowledgment: 'receiver-check-failed-before-input', error: error.message }; }
+  catch (error) { return { status: 'not-delivered', acknowledgment: 'receiver-check-failed-before-input', receiverGone: !!error.receiverGone, error: error.message }; }
   // Flatten newlines and reject terminal control characters before the effect.
   const prompt = target.prompt.replace(/[\r\n]+/g, ' ');
   // Claude Code and Codex both accept `/goal <objective>`: the session keeps working until the objective holds.

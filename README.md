@@ -37,7 +37,7 @@ The package is distributed as a GitHub release asset; npm registry publication i
 
 ## Upgrade from 0.1.0
 
-0.2.0 removes the `codex-queue` target. Update the plugin, remove the old cached version, and reload:
+0.2.0 removes the `codex-queue` target. A remaining `codex-queue` definition fails validation and stops every tick, `list`, the web page and the session-end hook, so remove those first with the 0.1.0 CLI (`agent-scheduler remove ID`; resolve a pending run before removal). Then update the plugin, remove the old cached version, and reload:
 
 ```sh
 claude plugin marketplace update agent-scheduler
@@ -120,7 +120,7 @@ The plugin skill runs these commands with `node <installed-plugin>/dist/cli.mjs`
 | `orca` | `orca terminal send --enter` to a runtime terminal handle | Transport accepted |
 | `tmux` | Literal text to an exact pane, then Enter | Transport accepted |
 
-Every terminal target is verified before input: the terminal must exist and a coding agent must still run in it. Otherwise nothing is typed and the daemon pauses the schedule. `mode: "goal"` delivers the prompt as `/goal <prompt>` for Claude Code and Codex alike. When a receiving session ends, the plugin's `SessionEnd` hook removes the schedules addressed to its terminal.
+Every terminal target is verified before input: the terminal must exist and a coding agent must still run in it. Otherwise nothing is typed; an absent receiver pauses the schedule, while a failed check (shutdown, timeout) leaves it enabled. `mode: "goal"` delivers the prompt as `/goal <prompt>` for Claude Code and Codex alike. When a receiving session ends (not on `/clear` or `/resume`), the plugin's `SessionEnd` hook removes the schedules addressed to its terminal; a schedule bound to an agent `session` is removed only by that session.
 
 Prompts are written at registration from the actual task context and stored verbatim, so every delivered instruction is readable in the definition and receipts. Transport acceptance does **not** prove a model turn started or finished. The engine does not judge tasks, merge PRs, or mark work complete.
 
