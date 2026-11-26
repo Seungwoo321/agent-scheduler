@@ -1,6 +1,6 @@
 {
   "name": "@seungwoo321/agent-scheduler",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "File-based scheduling for commands and existing agent sessions",
   "type": "module",
   "license": "MIT",
@@ -13,6 +13,7 @@
   "files": [
     "dist",
     "skills",
+    "hooks",
     ".claude-plugin",
     ".codex-plugin",
     "README.md",
@@ -25,7 +26,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "lint": "node --check src/core.mjs && node --check src/targets.mjs && node --check src/cli.mjs",
+    "lint": "node --check src/core.mjs && node --check src/targets.mjs && node --check src/cli.mjs && node --check src/ui.mjs",
     "test": "node --test test/*.test.mjs",
     "prepack": "npm run build"
   },
