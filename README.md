@@ -29,7 +29,7 @@ Start a new Codex session to discover the plugin's `schedule` skill. Both provid
 Standalone CLI from a [GitHub release](https://github.com/Seungwoo321/agent-scheduler/releases):
 
 ```sh
-npm install -g ./seungwoo321-agent-scheduler-0.3.1.tgz
+npm install -g ./seungwoo321-agent-scheduler-0.3.2.tgz
 agent-scheduler --help
 ```
 

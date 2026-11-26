@@ -1,6 +1,6 @@
 {
   "name": "@seungwoo321/agent-scheduler",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "File-based scheduling for commands and existing agent sessions",
   "type": "module",
   "license": "MIT",

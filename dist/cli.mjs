@@ -1463,9 +1463,9 @@ var page = true ? `<!doctype html>
   header .prefs label { display: flex; align-items: center; gap: var(--space-2); }
   section { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-4); margin-bottom: var(--space-6); overflow-x: auto; }
   .muted { color: var(--muted); } .nowrap { white-space: nowrap; word-break: normal; } .mono { font-family: var(--mono); font-size: 12px; word-break: break-all; }
-  table { width: 100%; border-collapse: collapse; } th, td { text-align: left; padding: var(--space-2); border-bottom: 1px solid var(--border); vertical-align: top; }
-  th { color: var(--muted); font-weight: 600; font-size: 12px; }
-  .button { min-height: 32px; min-width: 32px; padding: 0 var(--space-3); border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); color: var(--text); font: inherit; cursor: pointer; }
+  table { width: 100%; border-collapse: collapse; } th, td { text-align: left; padding: var(--space-2); border-bottom: 1px solid var(--border); vertical-align: top; word-break: keep-all; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; white-space: nowrap; }
+  .button { min-height: 32px; min-width: 32px; padding: 0 var(--space-3); border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); color: var(--text); font: inherit; cursor: pointer; white-space: nowrap; }
   .button[data-variant="primary"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
   .button[data-variant="danger"] { color: var(--danger); border-color: var(--danger); }
   .button:disabled { opacity: .5; cursor: not-allowed; }
@@ -1480,7 +1480,8 @@ var page = true ? `<!doctype html>
   .grid { display: grid; gap: var(--space-4); grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
   .stack { display: grid; gap: var(--space-4); }
   pre { margin: 0; padding: var(--space-3); background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); max-height: 320px; overflow: auto; font: 12px/1.4 var(--mono); white-space: pre-wrap; }
-  .prompt { white-space: pre-wrap; min-width: 320px; }
+  .prompt { white-space: pre-wrap; overflow-wrap: break-word; min-width: 20em; }
+  .receiver { width: 12em; } .trigger { width: 10em; } .when { width: 8em; }
   [role="tablist"] { display: flex; gap: var(--space-1); border-bottom: 1px solid var(--border); margin-bottom: var(--space-4); }
   [role="tab"] { min-height: 40px; padding: 0 var(--space-4); border: 0; border-bottom: 2px solid transparent; background: none; color: var(--muted); font: inherit; font-weight: 600; cursor: pointer; }
   [role="tab"][aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
@@ -1640,16 +1641,16 @@ async function refresh() {
     for (const { spec, state } of list) {
       const tr = document.createElement('tr');
       const s = cell(''); s.replaceChildren(state?.pending ? badge(t('pending'), 'warn') : spec.enabled ? badge(t('enabledBadge'), 'ok') : badge(t('paused'), 'muted'));
-      const actions = document.createElement('td'); actions.className = 'actions';
+      const actions = document.createElement('div'); actions.className = 'actions'; const actionsCell = cell(''); actionsCell.append(actions);
       const command = spec.target.type === 'command', id = encodeURIComponent(spec.id);
       actions.append(
         button(t('edit'), null, () => openEditor(spec), command || state?.pending),
         button(spec.enabled ? t('pause') : t('resume'), null, () => act('POST', \`/api/schedules/\${id}/\${spec.enabled ? 'pause' : 'resume'}\`)),
         button(t('delete'), 'danger', () => confirm(t('confirmDelete', spec.id)) && act('DELETE', \`/api/schedules/\${id}\`), state?.pending));
       const known = command ? null : receivers.get(receiverKey(spec.target));
-      const target = cell(known ? known.label : describeTarget(spec.target), known ? null : 'mono');
+      const target = cell(known ? known.label : describeTarget(spec.target), known ? 'receiver' : 'receiver mono');
       if (known) { const sub = document.createElement('div'); sub.className = 'mono muted'; sub.textContent = describeTarget(spec.target); target.append(sub); }
-      tr.append(cell(spec.id, 'mono nowrap'), target, cell(command ? t('commandTarget') : delivered(spec.target), 'prompt'), cell(describeTrigger(spec.trigger)), cell(when(state?.nextAt)), cell(\`\${state?.runs ?? 0} / \${spec.maxRuns}\`), cell(when(spec.expiresAt)), s, actions);
+      tr.append(cell(spec.id, 'mono nowrap'), target, cell(command ? t('commandTarget') : delivered(spec.target), 'prompt'), cell(describeTrigger(spec.trigger), 'trigger'), cell(when(state?.nextAt), 'when'), cell(\`\${state?.runs ?? 0} / \${spec.maxRuns}\`, 'nowrap'), cell(when(spec.expiresAt), 'when'), s, actionsCell);
       body.append(tr);
     }
     if (!list.length) { const tr = document.createElement('tr'); const td = cell(t('noSchedules'), 'muted'); td.colSpan = 9; tr.append(td); body.append(tr); }
@@ -1657,7 +1658,7 @@ async function refresh() {
     for (const run of runs.filter(Boolean).sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 50)) {
       const tr = document.createElement('tr'); const st = cell('');
       st.replaceChildren(badge(run.status, run.status === 'uncertain' || run.status === 'intent' ? 'danger' : run.status === 'not-delivered' ? 'warn' : 'ok'));
-      tr.append(cell(when(run.startedAt)), cell(run.id, 'mono'), st, cell(delivered(run.definition?.target), 'prompt'), cell(run.error ?? run.acknowledgment, 'muted'));
+      tr.append(cell(when(run.startedAt), 'when'), cell(run.id, 'mono nowrap'), st, cell(delivered(run.definition?.target), 'prompt'), cell(run.error ?? run.acknowledgment, 'muted'));
       hist.append(tr);
     }
   } catch (error) { fail(error); }
@@ -1905,7 +1906,7 @@ async function ensureDaemon() {
 try {
   await store.init();
   if (!command || command === "help" || command === "--help") {
-    console.log(`agent-scheduler 0.3.1 \u2014 Node >=22
+    console.log(`agent-scheduler 0.3.2 \u2014 Node >=22
 
 Usage: agent-scheduler COMMAND
 
